@@ -1,4 +1,6 @@
+from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Optional
 import numpy as np
 
 
@@ -6,8 +8,8 @@ import numpy as np
 class ValleyResult:
     """Output of find_valley_and_times for one channel."""
     accepted: bool
-    valley_low: float | None
-    valley_high: float | None
+    valley_low: Optional[float]
+    valley_high: Optional[float]
     left_times: np.ndarray      # int64 [NL]
     left_vals: np.ndarray       # float32 [NL]
     valley_times: np.ndarray    # int64 [NV]
@@ -34,7 +36,7 @@ class PCAKMeansResult:
     """Output of PCA + KMeans step."""
     pca_coords: np.ndarray      # float32 [N, n_pcs] — for scatter plot
     km_labels: np.ndarray       # int [N] — cluster 0 or 1
-    cluster_mean_waveforms: list[np.ndarray]  # [2] each shape [L] on detect_ch
+    cluster_mean_waveforms: list  # [np.ndarray, np.ndarray] each shape [L] on detect_ch
     explained_variance_ratio: np.ndarray
     n_pcs_used: int
 
@@ -77,7 +79,7 @@ class QCResult:
         return int(counts.get('uncertain_boundary', 0) + counts.get('uncertain_lowBL', 0))
 
     @property
-    def miss_rate(self) -> float | None:
+    def miss_rate(self) -> Optional[float]:
         """Fraction of LH-labeled spikes NOT found by sorter. None if n_sorter_spikes unknown."""
         if self.n_sorter_spikes < 0:
             return None
