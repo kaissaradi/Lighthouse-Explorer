@@ -109,18 +109,40 @@ class MainWindow(QMainWindow):
 
     # ── Data loading ─────────────────────────────────────────────
 
+    # Inside main_window.py, in the MainWindow class
+
     def on_load_requested(self, params: dict):
-        """Start background loading with LoaderWorker (non-blocking)."""
+        """Start background loading – auto‑detect single file or Litke folder."""
         dat_path = params.get("dat_path")
         if not dat_path:
-            self._status_bar.showMessage("No .dat file specified.")
+            self._status_bar.showMessage("No .dat file or folder specified.")
             return
 
         # Abort any existing loader
         self._abort_loader()
-
         self._load_panel.set_loading_state(True)
 
+        # --- NEW: detect if path is a directory (Litke bin folder) ---
+        if os.path.isdir(dat_path):
+            try:
+                from core.loader import load_litke_folder
+                n_channels = params["n_channels"]
+                dtype = params.get("dtype", "int16")
+                raw_data = load_litke_folder(dat_path, n_channels, dtype)
+                # Store the virtual array and proceed directly (no worker thread needed)
+                self.raw_data = raw_data
+                self._load_panel.set_loading_state(False)
+                self._status_bar.showMessage(
+                    f"Loaded Litke folder: {dat_path} ({raw_data.shape[0]} samples, {n_channels} ch)"
+                )
+                self._start_batch_qc()
+            except ImportError:
+                self._on_loader_error("bin2py not installed. Run: pip install bin2py")
+            except Exception as e:
+                self._on_loader_error(f"Failed to load Litke folder: {e}")
+            return
+
+        # --- Existing single‑file loader (Kilosort format) ---
         self._loader_thread = QThread()
         self._loader_worker = LoaderWorker(
             dat_path=dat_path,
@@ -137,7 +159,6 @@ class MainWindow(QMainWindow):
         self._loader_worker.error.connect(self._on_loader_error)
         self._loader_worker.aborted.connect(self._on_loader_aborted)
 
-        # Cleanup
         self._loader_worker.finished.connect(self._loader_thread.quit)
         self._loader_worker.finished.connect(self._loader_worker.deleteLater)
         self._loader_worker.error.connect(self._loader_thread.quit)

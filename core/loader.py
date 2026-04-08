@@ -2,12 +2,173 @@
 loader.py — raw data loading utilities for Lighthouse QC.
 
 Adapted from axolotl/io.py. All functions are pure (no Qt, no side effects).
+
+Added LitkeMultiFileArray to directly read a folder of .bin files (Litke format)
+without joining, automatically stripping the TTL channel (index 0).
 """
 from __future__ import annotations
 from typing import Optional
 import os
 import numpy as np
 
+# Try to import bin2py for Litke folder support
+try:
+    import bin2py
+    _BIN2PY_AVAILABLE = True
+except ImportError:
+    _BIN2PY_AVAILABLE = False
+
+
+class LitkeMultiFileArray:
+    """
+    A read‑only, array‑like wrapper over a folder of Litke .bin files.
+
+    The folder must contain chronological .bin files (e.g., data000.bin,
+    data001.bin, ...). Each file contains a TTL channel at index 0, followed
+    by the real electrode channels. This wrapper automatically strips the
+    TTL channel, so indexing uses 0‑based channel numbers corresponding to
+    the real electrodes (0 = first electrode after TTL).
+
+    Supports:
+        raw[start:stop, channels]   -> (n_rows, n_channels) or (n_rows, len(channels))
+        raw[sample, channel]        -> scalar
+        len(raw)                    -> total samples
+        raw.shape                   -> (total_samples, n_channels)
+    """
+    def __init__(self, folder_path: str, n_channels: int, dtype=np.int16):
+        """
+        Parameters
+        ----------
+        folder_path : str
+            Path to the folder containing .bin files.
+        n_channels : int
+            Number of real electrode channels (excluding TTL). The underlying
+            .bin files must have n_channels + 1 channels (TTL + electrodes).
+        dtype : np.dtype
+            Data type of the raw samples (default int16).
+        """
+        if not _BIN2PY_AVAILABLE:
+            raise ImportError("bin2py is required for Litke folder support. pip install bin2py")
+        if not os.path.isdir(folder_path):
+            raise NotADirectoryError(f"{folder_path} is not a directory")
+
+        self.folder_path = folder_path
+        self.n_channels = n_channels
+        self.dtype = np.dtype(dtype)
+        self._reader = bin2py.PyBinFileReader(folder_path, is_row_major=True)
+        self._n_samples = self._reader.length
+        # The reader returns (n_total_channels, n_samples) with TTL at index 0.
+        # We'll slice away the TTL when indexing.
+
+    @property
+    def shape(self):
+        return (self._n_samples, self.n_channels)
+
+    @property
+    def ndim(self):
+        return 2
+
+    @property
+    def size(self):
+        return self._n_samples * self.n_channels
+
+    def __len__(self):
+        return self._n_samples
+
+    def __getitem__(self, key):
+        """
+        Supports:
+            - raw[start:stop, col]          where col is int, slice, or list
+            - raw[sample_index, col]
+            - raw[start:stop]               (all channels)
+            - raw[sample_index]             (all channels)
+        """
+        # Parse key
+        if isinstance(key, tuple):
+            row_key, col_key = key
+        else:
+            row_key, col_key = key, slice(None)
+
+        # --- Single sample indexing ---
+        if isinstance(row_key, int):
+            # Read one time point (all electrodes including TTL)
+            block = self._reader.get_data(row_key, 1)   # shape (n_total_elec, 1)
+            # Strip TTL (first row) and convert to 1D
+            data = block[1:, 0].astype(self.dtype)      # (n_channels,)
+            if col_key == slice(None):
+                return data
+            elif isinstance(col_key, int):
+                return data[col_key]
+            else:
+                return data[col_key]
+
+        # --- Slicing along rows ---
+        if isinstance(row_key, slice):
+            start = row_key.start if row_key.start is not None else 0
+            stop = row_key.stop if row_key.stop is not None else self._n_samples
+            step = row_key.step if row_key.step is not None else 1
+            if step != 1:
+                raise NotImplementedError("Step != 1 not supported for multi‑file slicing")
+            n_rows = stop - start
+            if n_rows <= 0:
+                # Return empty array of appropriate shape
+                n_cols = self._get_col_count(col_key)
+                return np.empty((0, n_cols), dtype=self.dtype)
+
+            # Read the contiguous block from the reader
+            block = self._reader.get_data(start, n_rows)   # (n_total_elec, n_rows)
+            # Strip TTL (first row) -> (n_channels, n_rows)
+            data = block[1:, :].astype(self.dtype)        # (n_channels, n_rows)
+
+            if col_key == slice(None):
+                # Return (n_rows, n_channels)
+                return data.T
+            elif isinstance(col_key, int):
+                # Return (n_rows,) for a single channel
+                return data[col_key, :]
+            else:
+                # Return (n_rows, len(col_key)) for multiple channels
+                return data[col_key, :].T
+
+        raise TypeError(f"Unsupported key type: {type(row_key)}")
+
+    def _get_col_count(self, col_key):
+        if col_key == slice(None):
+            return self.n_channels
+        if isinstance(col_key, int):
+            return 1
+        return len(col_key)
+
+
+def load_litke_folder(
+    folder_path: str,
+    n_channels: int,
+    dtype: str = "int16",
+) -> LitkeMultiFileArray:
+    """
+    Load a folder of Litke .bin files as a single virtual array.
+
+    Parameters
+    ----------
+    folder_path : str
+        Path to the folder containing chronological .bin files.
+    n_channels : int
+        Number of real electrode channels (excluding the TTL channel).
+    dtype : str
+        NumPy dtype string (default "int16").
+
+    Returns
+    -------
+    LitkeMultiFileArray
+        An object that behaves like a (T, C) numpy array, but reads data
+        on‑the‑fly from the original files. No joining, no extra disk space.
+    """
+    return LitkeMultiFileArray(folder_path, n_channels, np.dtype(dtype))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Existing functions below – unchanged
+# ──────────────────────────────────────────────────────────────────────────────
 
 def load_raw_readonly(
     dat_path: str,
@@ -107,7 +268,7 @@ def load_sorter_spike_times(
     Load existing sorted spike times, keyed by channel index.
 
     Supports:
-      - Kilosart output dir (spike_times.npy + spike_clusters.npy + channel_map.npy)
+      - Kilosort output dir (spike_times.npy + spike_clusters.npy + channel_map.npy)
       - LH HDF5 file (peak_channel attr + spike_times per unit)
 
     Falls back to empty dict if path is None or unrecognized.

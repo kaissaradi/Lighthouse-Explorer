@@ -20,6 +20,7 @@ class ValleyResult:
     amp_hist_edges: np.ndarray
     left_count: int
     valley_count: int
+    rightk_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))  # added
 
 
 @dataclass
@@ -60,6 +61,7 @@ class QCResult:
     snippets: SnippetResult
     pca_km: PCAKMeansResult
     bltr: BLTRResult
+    reject_reason: Optional[str] = None   # added for early rejections
 
     @property
     def n_total(self) -> int:
