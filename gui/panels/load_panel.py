@@ -1,12 +1,13 @@
 """
 load_panel.py — Left sidebar: file paths, parameters, Load button.
+Now supports both single .dat/.bin files (Kilosort) and Litke bin folders.
 """
 from __future__ import annotations
 from typing import Optional
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QSpinBox, QDoubleSpinBox,
-    QComboBox, QFileDialog,
+    QComboBox, QFileDialog, QRadioButton, QButtonGroup,
 )
 from qtpy.QtCore import Signal
 
@@ -25,13 +26,32 @@ class LoadPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
 
+        # ── Source type selection ──────────────────────────────────
+        src_grp = QGroupBox("Source type")
+        src_layout = QHBoxLayout()
+        self.file_radio = QRadioButton("Single .dat/.bin file (Kilosort)")
+        self.folder_radio = QRadioButton("Litke bin folder")
+        self.file_radio.setChecked(True)
+        src_layout.addWidget(self.file_radio)
+        src_layout.addWidget(self.folder_radio)
+        src_grp.setLayout(src_layout)
+        layout.addWidget(src_grp)
+
         # ── Recording ──────────────────────────────────────────────
         rec_grp = QGroupBox("Recording")
         rec_layout = QVBoxLayout()
 
+        # File path (for single file mode)
         self._dat_path, self._dat_btn = self._file_row(
             rec_layout, ".dat/.bin", ".dat"
         )
+        # Folder path (for Litke mode) – initially hidden
+        self._folder_path, self._folder_btn = self._folder_row(
+            rec_layout, "Litke folder"
+        )
+        self._folder_path.setVisible(False)
+        self._folder_btn.setVisible(False)
+
         self._n_channels = QSpinBox()
         self._n_channels.setRange(1, 10000)
         self._n_channels.setValue(512)
@@ -112,6 +132,9 @@ class LoadPanel(QWidget):
         self._load_btn.clicked.connect(self._on_load)
         layout.addWidget(self._load_btn)
 
+        # Connect radio buttons to toggle visibility
+        self.file_radio.toggled.connect(self._on_source_type_changed)
+
     # ── helpers ────────────────────────────────────────────────────
 
     @staticmethod
@@ -121,7 +144,7 @@ class LoadPanel(QWidget):
         line = QLineEdit()
         btn = QPushButton("Browse")
         btn.clicked.connect(
-            lambda: LoadPanel._browse(line, ext)
+            lambda: LoadPanel._browse_file(line, ext)
         )
         row.addWidget(line)
         row.addWidget(btn)
@@ -129,9 +152,22 @@ class LoadPanel(QWidget):
         return line, btn
 
     @staticmethod
-    def _browse(line_edit: QLineEdit, ext: str):
+    def _folder_row(parent_layout: QVBoxLayout, label: str):
+        row = QHBoxLayout()
+        row.addWidget(QLabel(label))
+        line = QLineEdit()
+        btn = QPushButton("Browse Folder")
+        btn.clicked.connect(
+            lambda: LoadPanel._browse_folder(line)
+        )
+        row.addWidget(line)
+        row.addWidget(btn)
+        parent_layout.addLayout(row)
+        return line, btn
+
+    @staticmethod
+    def _browse_file(line_edit: QLineEdit, ext: str):
         if ext:
-            # Allow both .dat and .bin files
             path, _ = QFileDialog.getOpenFileName(
                 None, "Select File", "", f"Data Files (*.dat *.bin);;All Files (*)"
             )
@@ -143,6 +179,12 @@ class LoadPanel(QWidget):
             line_edit.setText(path)
 
     @staticmethod
+    def _browse_folder(line_edit: QLineEdit):
+        folder = QFileDialog.getExistingDirectory(None, "Select Litke Bin Folder")
+        if folder:
+            line_edit.setText(folder)
+
+    @staticmethod
     def _add_row(parent_layout: QVBoxLayout, label: str, widget):
         row = QHBoxLayout()
         lbl = QLabel(label)
@@ -150,6 +192,14 @@ class LoadPanel(QWidget):
         row.addWidget(lbl)
         row.addWidget(widget)
         parent_layout.addLayout(row)
+
+    def _on_source_type_changed(self):
+        """Show/hide the appropriate path widget based on radio button selection."""
+        is_file_mode = self.file_radio.isChecked()
+        self._dat_path.setVisible(is_file_mode)
+        self._dat_btn.setVisible(is_file_mode)
+        self._folder_path.setVisible(not is_file_mode)
+        self._folder_btn.setVisible(not is_file_mode)
 
     def _on_load(self):
         self.load_requested.emit(self.get_params())
@@ -162,8 +212,16 @@ class LoadPanel(QWidget):
     def get_params(self) -> dict:
         """Read all widget values and return as a params dict."""
         dur = self._duration_min.value()
-        return {
-            "dat_path": self._dat_path.text().strip(),
+        is_litke = self.folder_radio.isChecked()
+
+        if is_litke:
+            dat_path = self._folder_path.text().strip()
+        else:
+            dat_path = self._dat_path.text().strip()
+
+        params = {
+            "dat_path": dat_path,
+            "is_litke_folder": is_litke,
             "n_channels": self._n_channels.value(),
             "dtype": "int16",  # fixed default
             "fs": self._fs.value(),
@@ -176,6 +234,7 @@ class LoadPanel(QWidget):
             "min_bl_bulk": self._min_bl_bulk.value(),
             "max_snippets": self._max_snippets.value(),
         }
+        return params
 
     def set_loading_state(self, loading: bool):
         """Disable/enable the Load button during I/O."""
@@ -185,6 +244,15 @@ class LoadPanel(QWidget):
     def set_defaults(self, dat_path: Optional[str], n_channels: Optional[int]):
         """Pre-fill from CLI defaults."""
         if dat_path:
-            self._dat_path.setText(dat_path)
+            # If the default path is a directory, assume Litke folder and switch mode
+            import os
+            if os.path.isdir(dat_path):
+                self.folder_radio.setChecked(True)
+                self._folder_path.setText(dat_path)
+            else:
+                self.file_radio.setChecked(True)
+                self._dat_path.setText(dat_path)
         if n_channels:
             self._n_channels.setValue(n_channels)
+        # Ensure correct visibility after defaults
+        self._on_source_type_changed()
