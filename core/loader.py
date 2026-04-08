@@ -16,9 +16,10 @@ def load_raw_readonly(
     start_min: float = 0.0,
     duration_min: float | None = None,
     fs: int = 20_000,
+    writable: bool = False,
 ) -> np.memmap:
     """
-    Memory-map a chunk of a raw binary file as READ-ONLY [T, C].
+    Memory-map a chunk of a raw binary file [T, C].
 
     Parameters
     ----------
@@ -34,10 +35,14 @@ def load_raw_readonly(
         Duration to load in minutes. None = load entire file.
     fs : int
         Sampling rate in Hz.
+    writable : bool
+        If True, open in "c" (copy-on-write) mode. Modifications are
+        kept in memory and never written back to disk, preserving the
+        original file.
 
     Returns
     -------
-    np.memmap of shape (T, C), mode="r".
+    np.memmap of shape (T, C).
     """
     if not os.path.isfile(dat_path):
         raise FileNotFoundError(f"Recording not found: {dat_path}")
@@ -58,10 +63,11 @@ def load_raw_readonly(
 
     offset = start_sample * n_channels * itemsize
 
+    mode = "c" if writable else "r"
     mem = np.memmap(
         dat_path,
         dtype=dtype,
-        mode="r",
+        mode=mode,
         offset=offset,
         shape=(n_samples, n_channels),
     )

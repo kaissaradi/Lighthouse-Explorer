@@ -11,6 +11,7 @@ from .panels.array_map_panel import ArrayMapPanel
 from .panels.qc_view_panel import QCViewPanel
 from .workers.qc_worker import QCWorker
 from .workers.batch_qc_worker import BatchQCWorker
+from .workers.loader_worker import LoaderWorker
 from core import loader
 from core.lh_qc_pipeline import DEFAULT_PARAMS
 from core.result_types import QCResult
@@ -34,6 +35,8 @@ class MainWindow(QMainWindow):
         self.default_n_channels = default_n_channels
 
         # Workers / threads
+        self._loader_thread: Optional[QThread] = None
+        self._loader_worker: Optional[LoaderWorker] = None
         self._single_thread: Optional[QThread] = None
         self._single_worker: Optional[QCWorker] = None
         self._batch_thread: Optional[QThread] = None
@@ -107,48 +110,76 @@ class MainWindow(QMainWindow):
     # ── Data loading ─────────────────────────────────────────────
 
     def on_load_requested(self, params: dict):
-        """Load raw data, update panels, auto-start batch QC."""
-        try:
-            self._load_panel.set_loading_state(True)
-            self._status_bar.showMessage("Loading recording…")
+        """Start background loading with LoaderWorker (non-blocking)."""
+        dat_path = params.get("dat_path")
+        if not dat_path:
+            self._status_bar.showMessage("No .dat file specified.")
+            return
 
-            dat_path = params["dat_path"]
-            if not dat_path:
-                self._status_bar.showMessage("No .dat file specified.")
-                return
+        # Abort any existing loader
+        self._abort_loader()
 
-            n_ch = params["n_channels"]
-            self.raw_data = loader.load_raw_readonly(
-                dat_path,
-                n_channels=n_ch,
-                dtype=params.get("dtype", "int16"),
-                start_min=params.get("start_min", 0.0),
-                duration_min=params.get("duration_min", None),
-                fs=params.get("fs", 20_000),
-            )
+        self._load_panel.set_loading_state(True)
 
-            # Build channel list
-            self._channel_list.set_array(np.arange(n_ch).reshape(-1, 1))
+        self._loader_thread = QThread()
+        self._loader_worker = LoaderWorker(
+            dat_path=dat_path,
+            n_channels=params["n_channels"],
+            dtype=params.get("dtype", "int16"),
+            start_min=params.get("start_min", 0.0),
+            duration_min=params.get("duration_min", None),
+            fs=params.get("fs", 20_000),
+        )
+        self._loader_worker.moveToThread(self._loader_thread)
+        self._loader_thread.started.connect(self._loader_worker.run)
+        self._loader_worker.progress.connect(self._status_bar.showMessage)
+        self._loader_worker.finished.connect(self._on_loader_finished)
+        self._loader_worker.error.connect(self._on_loader_error)
+        self._loader_worker.aborted.connect(self._on_loader_aborted)
 
-            # Update params for QC runs
-            self.lh_params.update({
-                "min_valid_count": params.get("min_valid_count", 300),
-                "min_bl_bulk": params.get("min_bl_bulk", 0.70),
-                "max_snippets": params.get("max_snippets", 5000),
-            })
+        # Cleanup
+        self._loader_worker.finished.connect(self._loader_thread.quit)
+        self._loader_worker.finished.connect(self._loader_worker.deleteLater)
+        self._loader_worker.error.connect(self._loader_thread.quit)
+        self._loader_worker.aborted.connect(self._loader_thread.quit)
+        self._loader_thread.finished.connect(self._loader_thread.deleteLater)
 
-            self._status_bar.showMessage(
-                f"Loaded {self.raw_data.shape[0]} samples × {n_ch} channels. Starting batch QC…"
-            )
+        self._loader_thread.start()
 
-            # Auto-start batch QC on all channels
-            self._start_batch_qc()
+    def _on_loader_finished(self, raw_data):
+        """Loader completed successfully — store data and start batch QC."""
+        n_ch = raw_data.shape[1]
+        self.raw_data = raw_data
 
-        except Exception as e:
-            self._status_bar.showMessage(f"Load failed: {e}")
-            self._qc_view.show_error(f"Load failed: {e}")
-        finally:
-            self._load_panel.set_loading_state(False)
+        # Build channel list
+        self._channel_list.set_array(np.arange(n_ch).reshape(-1, 1))
+
+        self._status_bar.showMessage(
+            f"Loaded {self.raw_data.shape[0]} samples × {n_ch} channels. Starting batch QC…"
+        )
+
+        self._load_panel.set_loading_state(False)
+
+        # Auto-start batch QC
+        self._start_batch_qc()
+
+    def _on_loader_error(self, msg: str):
+        """Loader failed."""
+        self._status_bar.showMessage(msg)
+        self._qc_view.show_error(msg)
+        self._load_panel.set_loading_state(False)
+
+    def _on_loader_aborted(self):
+        """Loader was cancelled."""
+        self._status_bar.showMessage("Loading cancelled.")
+        self._load_panel.set_loading_state(False)
+
+    def _abort_loader(self):
+        """Gracefully ask the loader worker to stop."""
+        if self._loader_worker:
+            self._loader_worker.abort()
+        if self._loader_thread and self._loader_thread.isRunning():
+            self._loader_thread.quit()
 
     def on_sorter_load_requested(self, path: str):
         """Load sorter spike times for miss-rate QC."""
@@ -400,6 +431,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Abort workers and request async cleanup, then accept close."""
+        self._abort_loader()
         if self._batch_worker:
             self._batch_worker.abort()
         if self._single_worker:

@@ -197,6 +197,7 @@ def run_bltr_labeling(
     snippets: SnippetResult,
     valley: ValleyResult,
     params: dict,
+    detect_ch: int,
 ) -> BLTRResult:
     """
     Step 4: BL/TR support labeling.
@@ -212,7 +213,6 @@ def run_bltr_labeling(
     N = snips.shape[2]
     C = snips.shape[0]
     L = snips.shape[1]
-    detect_ch = int(np.argmin(valley.all_vals)) if valley.all_vals.size > 0 else 0
     detect_ch = max(0, min(detect_ch, C - 1))
 
     min_bl_bulk = float(params.get("min_bl_bulk", 0.70))
@@ -240,17 +240,7 @@ def run_bltr_labeling(
     else:
         ei_valley = snips.mean(axis=2)
 
-    # Vectorized BL/TR: compute per-spike EI and cosine similarity
-    # Mean across channels gives [C, N] — one waveform per spike
-    ei_per_spike = snips.mean(axis=2)  # [C, L] — this is wrong, let me fix
-
-    # Actually: mean across axis=1 (L) gives [C, N] — amplitude per channel per spike
-    # But we want EI which is [C, L]. Mean across axis=2 gives [C, L] for ALL spikes
-    # For per-spike "EI" (just the snippet itself): snips[:, :, i] is [C, L]
-    # To vectorize, compute cosine similarity using numpy broadcasting
-
-    # RMS-gated cosine: simplify by computing dot product norm on detect_ch only
-    # This approximates the full cosine_two_eis but much faster
+    # Compute cosine similarity on detect_ch only (fast approximation)
     ch = detect_ch
     waveforms = snips[ch, :, :].T  # [N, L]
 
@@ -315,23 +305,30 @@ def run_qc_pipeline(
     if params is None:
         params = dict(DEFAULT_PARAMS)
 
+    # Compute snippet length once from params
+    sw = tuple(params.get("snippet_window", (-20, 40)))
+    snippet_len = sw[1] - sw[0] + 1  # e.g. (-20, 40) → 61
+
     # Step 1: Valley detection
     valley = run_valley_detection(raw_data, ch, params)
-    
+
     # Collect all candidate times for snippet extraction
     all_times = valley.all_times
     if all_times.size == 0:
         # Create empty results for degenerate case
         snippets = SnippetResult(
-            snippets=np.empty((raw_data.shape[1], 60, 0), dtype=np.float32),
+            snippets=np.empty((raw_data.shape[1], snippet_len, 0), dtype=np.float32),
             times=np.array([], dtype=np.int64),
             n_channels=raw_data.shape[1],
-            snippet_len=60,
+            snippet_len=snippet_len,
         )
         pca_km = PCAKMeansResult(
             pca_coords=np.empty((0, 3), dtype=np.float32),
             km_labels=np.array([], dtype=np.int64),
-            cluster_mean_waveforms=[np.zeros(60, dtype=np.float32), np.zeros(60, dtype=np.float32)],
+            cluster_mean_waveforms=[
+                np.zeros(snippet_len, dtype=np.float32),
+                np.zeros(snippet_len, dtype=np.float32),
+            ],
             explained_variance_ratio=np.array([0.33, 0.33, 0.33], dtype=np.float32),
             n_pcs_used=3,
         )
@@ -385,7 +382,7 @@ def run_qc_pipeline(
     pca_km = run_pca_kmeans(snippets, ch, params)
 
     # Step 4: BL/TR labeling
-    bltr = run_bltr_labeling(snippets, valley, params)
+    bltr = run_bltr_labeling(snippets, valley, params, detect_ch=ch)
 
     return QCResult(
         channel=ch,

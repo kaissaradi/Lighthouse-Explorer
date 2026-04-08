@@ -149,11 +149,11 @@ class QCViewPanel(QWidget):
             return
 
         counts, edges = result.valley.amp_hist_counts, result.valley.amp_hist_edges
-        centers = (edges[:-1] + edges[1:]) / 2.0
 
-        # Bar chart
+        # pyqtgraph with stepMode=True requires len(x) == len(y) + 1
+        # Pass the full edges array (length N+1), not the centers
         p.plot(
-            centers,
+            edges,
             counts,
             stepMode=True,
             fillLevel=0,
