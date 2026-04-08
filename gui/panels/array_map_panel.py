@@ -1,163 +1,236 @@
 """
-array_map_panel.py — Interactive electrode array spatial map with clickable channels.
+array_map_panel.py — Channel selector with grouped views and progress bar.
 """
 from __future__ import annotations
 from typing import Optional
-import numpy as np
-import pyqtgraph as pg
 from qtpy.QtCore import Signal, Qt
-from qtpy.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel
+from qtpy.QtGui import QColor, QBrush, QFont
+from qtpy.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QLineEdit,
+    QPushButton,
+    QProgressBar,
+    QComboBox,
+)
 
 
 class ArrayMapPanel(QWidget):
-    """Spatial map of electrode positions. Click → select channel."""
+    """Channel selector with groups: All / LH Found / Uncertain / No LH."""
 
     channel_selected = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._ei_positions: Optional[np.ndarray] = None
-        self._channel_colors: dict = {}
+        self._n_channels: int = 0
         self._selected_ch: Optional[int] = None
-        self._scatter: Optional[pg.ScatterPlotItem] = None
-        self._color_mode: str = "flat"  # flat | fr | qc
-        self._fr_values: dict = {}
-        self._qc_colors: dict = {}
+        self._qc_results: dict = {}  # {ch: QCResult}
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
-        # Top toolbar
+        # Top toolbar: group filter + search + Go
         toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("Coloring:"))
-        self._color_combo = QComboBox()
-        self._color_combo.addItems(["Flat", "Firing Rate", "QC miss-rate"])
-        self._color_combo.currentTextChanged.connect(self._on_color_mode_changed)
-        toolbar.addWidget(self._color_combo)
+        toolbar.addWidget(QLabel("View:"))
+        self._view_combo = QComboBox()
+        self._view_combo.addItems(["All", "LH Found", "Uncertain", "No LH"])
+        self._view_combo.currentTextChanged.connect(self._rebuild_list)
+        toolbar.addWidget(self._view_combo)
+        toolbar.addWidget(QLabel("CH:"))
+        self._ch_input = QLineEdit()
+        self._ch_input.setPlaceholderText("#")
+        self._ch_input.returnPressed.connect(self._on_go)
+        self._ch_input.setMaximumWidth(50)
+        toolbar.addWidget(self._ch_input)
+        self._go_btn = QPushButton("Go")
+        self._go_btn.clicked.connect(self._on_go)
+        toolbar.addWidget(self._go_btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
-        # Plot
-        self._plot = pg.PlotWidget()
-        self._plot.showGrid(x=True, y=True, alpha=0.15)
-        self._plot.setAspectLocked(True)
-        self._plot.hideAxis("bottom")
-        self._plot.hideAxis("left")
-        layout.addWidget(self._plot)
+        # Progress bar (shown during batch QC)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setMaximumHeight(14)
+        layout.addWidget(self._progress_bar)
 
-        self._scatter = pg.ScatterPlotItem(
-            size=8, pen=pg.mkPen("#5A5C65", width=0.5), brush=pg.mkBrush("#888888")
-        )
-        self._scatter.sigClicked.connect(self._on_click)
-        self._plot.addItem(self._scatter)
+        # Progress label
+        self._progress_lbl = QLabel("")
+        self._progress_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        self._progress_lbl.setVisible(False)
+        layout.addWidget(self._progress_lbl)
 
-    def set_array(self, ei_positions: np.ndarray):
-        """Load electrode positions and render all channels."""
-        self._ei_positions = np.asarray(ei_positions, dtype=np.float64)
-        n = self._ei_positions.shape[0]
-        self._channel_colors = {}
-        self._qc_colors.clear()
+        # Channel list
+        self._channel_list = QListWidget()
+        self._channel_list.itemClicked.connect(self._on_item_clicked)
+        layout.addWidget(self._channel_list)
+
+        # Status label
+        self._status_lbl = QLabel("No recording loaded.")
+        self._status_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self._status_lbl)
+
+    def set_array(self, ei_positions):
+        """
+        Populate channels after data load.
+        ei_positions: [C, 2] or [C, 1] — we use C (num channels).
+        """
+        import numpy as np
+
+        positions = np.asarray(ei_positions)
+        self._n_channels = positions.shape[0]
         self._selected_ch = None
+        self._qc_results.clear()
 
-        xs = self._ei_positions[:, 0]
-        ys = self._ei_positions[:, 1]
-        self._scatter.setData(
-            x=xs,
-            y=ys,
-            size=8,
-            pen=pg.mkPen("#5A5C65", width=0.5),
-            brush=pg.mkBrush("#888888"),
-            data=np.arange(n),
-        )
-        self._plot.autoRange()
+        self._status_lbl.setText(f"{self._n_channels} channels loaded.")
+        self._rebuild_list()
 
-    def set_channel_colors(self, color_map: dict[int, tuple]):
-        """Update all dot colors. color_map: {ch: (r,g,b)} 0-255."""
-        self._channel_colors = color_map
-        self._apply_colors()
+    def set_progress(self, current: int, total: int, message: str = ""):
+        """Show progress during batch QC."""
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setMaximum(total)
+        self._progress_bar.setValue(current)
+        self._progress_lbl.setVisible(True)
+        self._progress_lbl.setText(message or f"CH {current}/{total}")
 
-    def set_selected_channel(self, ch: int):
-        """Highlight the selected channel with a larger ring."""
-        self._selected_ch = ch
-        self._apply_colors()
+    def hide_progress(self):
+        """Hide progress bar after batch QC completes."""
+        self._progress_bar.setVisible(False)
+        self._progress_lbl.setVisible(False)
+
+    def update_channel_result(self, ch: int, result):
+        """Add a completed QC result and refresh the list."""
+        self._qc_results[ch] = result
+        self._rebuild_list()
 
     def set_qc_result_color(self, ch: int, miss_rate: Optional[float]):
         """
-        Color a single channel after QC: miss_rate 0→green ... 1→red, None→gray.
+        Update a channel's display after QC. Called from main window.
+        We rebuild the whole list to keep grouping consistent.
         """
-        if miss_rate is None:
-            self._qc_colors[ch] = (136, 136, 136)
-        else:
-            r = int(255 * miss_rate)
-            g = int(255 * (1.0 - miss_rate))
-            self._qc_colors[ch] = (r, g, 40)
-        self._apply_colors()
+        # Just trigger a rebuild — colors are applied in _rebuild_list
+        self._rebuild_list()
+
+    def set_selected_channel(self, ch: int):
+        """Highlight the selected channel in the list."""
+        self._selected_ch = ch
+        for i in range(self._channel_list.count()):
+            item = self._channel_list.item(i)
+            if item.data(Qt.UserRole) == ch:
+                item.setSelected(True)
+                self._channel_list.scrollToItem(item)
+                break
 
     def set_firing_rates(self, fr_values: dict[int, float]):
-        """Set firing rates for FR coloring mode."""
-        self._fr_values = fr_values
+        """Not used — no-op."""
+        pass
 
     def clear(self):
-        """Reset the array display."""
-        self._ei_positions = None
-        self._channel_colors.clear()
-        self._qc_colors.clear()
-        self._fr_values.clear()
+        """Reset the channel list."""
+        self._n_channels = 0
         self._selected_ch = None
-        self._scatter.clear()
+        self._qc_results.clear()
+        self._channel_list.clear()
+        self._status_lbl.setText("No recording loaded.")
+        self.hide_progress()
 
     # ── internal ───────────────────────────────────────────────────
 
-    def _on_color_mode_changed(self, mode: str):
-        if "Flat" in mode:
-            self._color_mode = "flat"
-        elif "Firing" in mode:
-            self._color_mode = "fr"
-        elif "QC" in mode:
-            self._color_mode = "qc"
-        self._apply_colors()
+    def _get_group_channels(self) -> list[int]:
+        """Return channels matching current view filter."""
+        view = self._view_combo.currentText()
+        if view == "All":
+            return list(range(self._n_channels))
 
-    def _apply_colors(self):
-        if self._ei_positions is None or self._scatter is None:
+        channels = []
+        for ch in range(self._n_channels):
+            result = self._qc_results.get(ch)
+            if result is None:
+                continue
+
+            n_lh = result.n_lh
+            n_total = result.n_total
+
+            if view == "LH Found":
+                if n_lh > 0:
+                    channels.append(ch)
+            elif view == "Uncertain":
+                if result.n_uncertain > 0:
+                    channels.append(ch)
+            elif view == "No LH":
+                if n_lh == 0 and n_total > 0:
+                    channels.append(ch)
+
+        return channels
+
+    def _rebuild_list(self):
+        """Rebuild the channel list based on current view filter."""
+        self._channel_list.clear()
+        channels = self._get_group_channels()
+
+        for ch in channels:
+            result = self._qc_results.get(ch)
+            if result:
+                label = f"CH {ch} — {result.n_lh} LH, {result.n_soup} soup, {result.n_uncertain} unc"
+                # Color based on LH ratio
+                if result.n_total > 0:
+                    lh_ratio = result.n_lh / result.n_total
+                else:
+                    lh_ratio = 0
+                r = int(255 * (1.0 - lh_ratio))
+                g = int(255 * lh_ratio)
+                color = QColor(r, g, 40)
+            else:
+                label = f"CH {ch} — pending"
+                color = QColor(136, 136, 136)
+
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, ch)
+            item.setForeground(QBrush(color))
+            self._channel_list.addItem(item)
+
+        # Update status
+        shown = len(channels)
+        total = self._n_channels
+        self._status_lbl.setText(f"Showing {shown}/{total} channels.")
+
+        # Re-select if current channel is visible
+        if self._selected_ch is not None:
+            self.set_selected_channel(self._selected_ch)
+
+    def _on_item_clicked(self, item: QListWidgetItem):
+        ch = item.data(Qt.UserRole)
+        if ch is not None:
+            self.channel_selected.emit(int(ch))
+
+    def _on_go(self):
+        """Jump to a specific channel by number."""
+        text = self._ch_input.text().strip()
+        if not text:
+            return
+        try:
+            ch = int(text)
+        except ValueError:
             return
 
-        n = self._ei_positions.shape[0]
-        brushes = []
-        pens = []
-        sizes = []
+        if 0 <= ch < self._n_channels:
+            # Switch to "All" view so the channel is visible
+            self._view_combo.setCurrentText("All")
+            self._select_channel_by_index(ch)
+            self._ch_input.clear()
 
-        for i in range(n):
-            r, g, b = 136, 136, 136  # default gray
-
-            if self._color_mode == "qc" and i in self._qc_colors:
-                r, g, b = self._qc_colors[i]
-            elif self._color_mode == "fr" and i in self._fr_values:
-                fr = self._fr_values[i]
-                # blue (0) → yellow (high)
-                t = min(1.0, fr / 50.0)
-                r, g, b = int(30 + 225 * t), int(60 + 195 * t), int(200 * (1 - t))
-            elif i in self._channel_colors:
-                r, g, b = self._channel_colors[i]
-
-            pen_color = "#2E6DD4" if i == self._selected_ch else "#5A5C65"
-            size = 12 if i == self._selected_ch else 8
-
-            brushes.append(pg.mkBrush(r, g, b))
-            pens.append(pg.mkPen(pen_color, width=2 if i == self._selected_ch else 0.5))
-            sizes.append(size)
-
-        self._scatter.setBrush(brushes)
-        self._scatter.setPen(pens)
-        self._scatter.setSize(sizes)
-
-    def _on_click(self, scatter, points):
-        """Handle pyqtgraph scatter click."""
-        if not points:
-            return
-        pt = list(points)[0]
-        idx = pt.data()
-        if idx is not None:
-            ch = int(idx)
-            self.channel_selected.emit(ch)
+    def _select_channel_by_index(self, ch: int):
+        """Programmatically select a channel and emit signal."""
+        for i in range(self._channel_list.count()):
+            item = self._channel_list.item(i)
+            if item.data(Qt.UserRole) == ch:
+                self._channel_list.setCurrentItem(item)
+                self._channel_list.scrollToItem(item)
+                self.channel_selected.emit(ch)
+                break

@@ -37,10 +37,6 @@ class LoadPanel(QWidget):
         self._n_channels.setValue(512)
         self._add_row(rec_layout, "n_channels", self._n_channels)
 
-        self._dtype = QComboBox()
-        self._dtype.addItems(["int16", "int32", "float32"])
-        self._add_row(rec_layout, "dtype", self._dtype)
-
         self._fs = QSpinBox()
         self._fs.setRange(1000, 100000)
         self._fs.setValue(20000)
@@ -135,8 +131,9 @@ class LoadPanel(QWidget):
     @staticmethod
     def _browse(line_edit: QLineEdit, ext: str):
         if ext:
+            # Allow both .dat and .bin files
             path, _ = QFileDialog.getOpenFileName(
-                None, "Select File", "", f"Files (*{ext});;All Files (*)"
+                None, "Select File", "", f"Data Files (*.dat *.bin);;All Files (*)"
             )
         else:
             path = QFileDialog.getExistingDirectory(
@@ -168,7 +165,7 @@ class LoadPanel(QWidget):
         return {
             "dat_path": self._dat_path.text().strip(),
             "n_channels": self._n_channels.value(),
-            "dtype": self._dtype.currentText(),
+            "dtype": "int16",  # fixed default
             "fs": self._fs.value(),
             "start_min": self._start_min.value(),
             "duration_min": dur if dur > 0 else None,

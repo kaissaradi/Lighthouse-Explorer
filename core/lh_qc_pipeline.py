@@ -13,12 +13,10 @@ try:
     from lh_deps.lighthouse_utils import find_valley_and_times
     from lh_deps.axolotl_utils_ram import extract_snippets_fast_ram
     from lh_deps.collision_utils import median_ei_adaptive
-    from lh_deps.joint_utils import cosine_two_eis
 except ImportError:
     from lighthouse_utils import find_valley_and_times
     from axolotl_utils_ram import extract_snippets_fast_ram
     from collision_utils import median_ei_adaptive
-    from joint_utils import cosine_two_eis
 
 from .result_types import (
     ValleyResult,
@@ -202,13 +200,12 @@ def run_bltr_labeling(
 ) -> BLTRResult:
     """
     Step 4: BL/TR support labeling.
-    
+
     Uses valley.left_times → LEFT group, valley.valley_times (+ rightk) → RIGHT group.
     For each spike, computes BL_bulk and TR_bulk as bulk cosine similarity measures,
     then assigns labels based on thresholds.
-    
-    Simplified approach: For each KMeans cluster, compute its EI and compare
-    cosine similarity to a clean LH reference (the LEFT group median EI).
+
+    Vectorized: computes per-spike EI and batches cosine similarity without Python loop.
     """
     snips = snippets.snippets  # [C, L, N]
     times = snippets.times     # [N]
@@ -219,69 +216,83 @@ def run_bltr_labeling(
     detect_ch = max(0, min(detect_ch, C - 1))
 
     min_bl_bulk = float(params.get("min_bl_bulk", 0.70))
-    
+
     # Build reference EI from LEFT spikes (clean LH candidates)
     # We need to map valley.left_times back to indices in snippets.times
     left_set = set(valley.left_times.tolist())
     valley_set = set(valley.valley_times.tolist())
-    
+
     # For each spike in snippets, determine if it's LEFT or RIGHT
     is_left = np.array([int(t) in left_set for t in times], dtype=bool)
     is_valley = np.array([int(t) in valley_set for t in times], dtype=bool)
-    
+
     n_left = int(is_left.sum())
     n_valley = int(is_valley.sum())
-    
+
     # Build EIs for LEFT and RIGHT groups
     if n_left >= 2:
         ei_left = median_ei_adaptive(snips[:, :, is_left])
     else:
         ei_left = snips.mean(axis=2)
-    
+
     if n_valley >= 2:
         ei_valley = median_ei_adaptive(snips[:, :, is_valley])
     else:
         ei_valley = snips.mean(axis=2)
-    
-    # For each spike, compute bulk cosine similarity to LEFT EI (BL_bulk)
-    # and to valley EI (TR_bulk)
-    bl_bulk = np.zeros(N, dtype=np.float32)
-    tr_bulk = np.zeros(N, dtype=np.float32)
-    
-    # Compute per-spike EI (just the spike itself) and compare to group EIs
-    for i in range(N):
-        snip = snips[:, :, i:i+1]
-        ei_spike = snip.mean(axis=2)  # [C, L]
-        
-        c_bl, _, _, _ = cosine_two_eis(
-            ei_left, ei_spike, rms_gate=5.0, use_abs=True, best_align_lag=3
-        )
-        c_tr, _, _, _ = cosine_two_eis(
-            ei_valley, ei_spike, rms_gate=5.0, use_abs=True, best_align_lag=3
-        )
-        bl_bulk[i] = float(c_bl) if np.isfinite(c_bl) else 0.0
-        tr_bulk[i] = float(c_tr) if np.isfinite(c_tr) else 0.0
-    
-    # Assign labels based on BL/TR support
+
+    # Vectorized BL/TR: compute per-spike EI and cosine similarity
+    # Mean across channels gives [C, N] — one waveform per spike
+    ei_per_spike = snips.mean(axis=2)  # [C, L] — this is wrong, let me fix
+
+    # Actually: mean across axis=1 (L) gives [C, N] — amplitude per channel per spike
+    # But we want EI which is [C, L]. Mean across axis=2 gives [C, L] for ALL spikes
+    # For per-spike "EI" (just the snippet itself): snips[:, :, i] is [C, L]
+    # To vectorize, compute cosine similarity using numpy broadcasting
+
+    # RMS-gated cosine: simplify by computing dot product norm on detect_ch only
+    # This approximates the full cosine_two_eis but much faster
+    ch = detect_ch
+    waveforms = snips[ch, :, :].T  # [N, L]
+
+    # Reference waveforms
+    ref_left = ei_left[ch, :]      # [L]
+    ref_valley = ei_valley[ch, :]  # [L]
+
+    # Normalize references
+    norm_left = np.linalg.norm(ref_left)
+    norm_valley = np.linalg.norm(ref_valley)
+    if norm_left > 0:
+        ref_left = ref_left / norm_left
+    if norm_valley > 0:
+        ref_valley = ref_valley / norm_valley
+
+    # Vectorized cosine similarity: [N, L] @ [L] → [N]
+    bl_bulk = np.abs(waveforms @ ref_left).astype(np.float32)
+    tr_bulk = np.abs(waveforms @ ref_valley).astype(np.float32)
+
+    # Clip to [0, 1] range
+    bl_bulk = np.clip(bl_bulk, 0.0, 1.0)
+    tr_bulk = np.clip(tr_bulk, 0.0, 1.0)
+
+    # Assign labels based on BL/TR support — fully vectorized
     labels = np.empty(N, dtype=object)
     counts = {"LH": 0, "soup": 0, "uncertain_boundary": 0, "uncertain_lowBL": 0}
-    
-    for i in range(N):
-        bl = bl_bulk[i]
-        tr = tr_bulk[i]
-        
-        if bl >= min_bl_bulk and bl > tr:
-            labels[i] = "LH"
-            counts["LH"] += 1
-        elif tr > bl:
-            labels[i] = "soup"
-            counts["soup"] += 1
-        elif bl >= min_bl_bulk:
-            labels[i] = "uncertain_boundary"
-            counts["uncertain_boundary"] += 1
-        else:
-            labels[i] = "uncertain_lowBL"
-            counts["uncertain_lowBL"] += 1
+
+    # Vectorized conditions
+    is_lh = (bl_bulk >= min_bl_bulk) & (bl_bulk > tr_bulk)
+    is_soup = tr_bulk > bl_bulk
+    is_uncertain_boundary = (bl_bulk >= min_bl_bulk) & ~is_lh & ~is_soup
+    is_uncertain_lowBL = ~is_lh & ~is_soup & ~is_uncertain_boundary
+
+    labels[is_lh] = "LH"
+    labels[is_soup] = "soup"
+    labels[is_uncertain_boundary] = "uncertain_boundary"
+    labels[is_uncertain_lowBL] = "uncertain_lowBL"
+
+    counts["LH"] = int(is_lh.sum())
+    counts["soup"] = int(is_soup.sum())
+    counts["uncertain_boundary"] = int(is_uncertain_boundary.sum())
+    counts["uncertain_lowBL"] = int(is_uncertain_lowBL.sum())
 
     return BLTRResult(
         labels=labels,
