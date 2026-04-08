@@ -106,11 +106,19 @@ def run_snippet_extraction(
     all_times: np.ndarray,
     params: dict,
 ) -> SnippetResult:
-    """Step 2: Extract snippets around all candidate times on ALL channels."""
+    """Step 2: Extract snippets around candidate times on ALL channels."""
     sw = tuple(params.get("snippet_window", (-20, 40)))
     max_snip = int(params.get("max_snippets", 5000))
     n_channels = raw_data.shape[1]
     all_ch = np.arange(n_channels, dtype=np.int32)
+
+    # Cap BEFORE extraction to avoid allocating massive arrays
+    n_total = all_times.size
+    if n_total > max_snip:
+        rng = np.random.default_rng(42)
+        keep = rng.choice(n_total, size=max_snip, replace=False)
+        keep.sort()
+        all_times = all_times[keep].copy()
 
     snippets, valid_times = extract_snippets_fast_ram(
         raw_data=raw_data,
@@ -118,15 +126,6 @@ def run_snippet_extraction(
         window=sw,
         selected_channels=all_ch,
     )
-
-    # Cap by random downsampling if needed
-    n_snippets = snippets.shape[2]
-    if n_snippets > max_snip:
-        rng = np.random.default_rng(42)
-        keep = rng.choice(n_snippets, size=max_snip, replace=False)
-        keep.sort()
-        snippets = snippets[:, :, keep].copy()
-        valid_times = valid_times[keep].copy()
 
     return SnippetResult(
         snippets=snippets.astype(np.float32),
