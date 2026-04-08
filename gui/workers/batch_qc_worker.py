@@ -21,11 +21,13 @@ class BatchQCWorker(QObject):
         raw_data,
         params: dict,
         sorter_spike_times: dict = None,
+        fs: float = 20000.0,
     ):
         super().__init__()
         self.raw_data = raw_data
         self.params = params if params else dict(DEFAULT_PARAMS)
         self.sorter_spike_times = sorter_spike_times or {}
+        self.fs = fs
         self._abort = False
 
     def abort(self):
@@ -48,13 +50,15 @@ class BatchQCWorker(QObject):
                     n_channels,
                 )
 
-                n_sorter = len(self.sorter_spike_times.get(ch, []))
+                # Get sorter spike count for this channel
+                n_sorter = len(self.sorter_spike_times.get(ch, [])) if self.sorter_spike_times else -1
 
                 result = run_qc_pipeline(
                     raw_data=self.raw_data,
                     ch=ch,
                     n_sorter_spikes=n_sorter,
                     params=self.params,
+                    fs=self.fs,
                 )
 
                 # Emit immediately — don't accumulate in memory
