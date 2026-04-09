@@ -121,6 +121,16 @@ class LoadPanel(QWidget):
         self._max_snippets.setValue(5000)
         self._add_row(param_layout, "max_snippets", self._max_snippets)
 
+        self._min_trough = QSpinBox()
+        self._min_trough.setRange(-5000, 0)
+        self._min_trough.setValue(-200)
+        self._add_row(param_layout, "min_trough", self._min_trough)
+
+        self._bin_width = QDoubleSpinBox()
+        self._bin_width.setRange(1.0, 50.0)
+        self._bin_width.setValue(10.0)
+        self._add_row(param_layout, "bin_width", self._bin_width)
+
         param_grp.setLayout(param_layout)
         layout.addWidget(param_grp)
 
@@ -229,10 +239,11 @@ class LoadPanel(QWidget):
             "duration_min": dur if dur > 0 else None,
             "map_path": self._map_path.text().strip() or None,
             "sorter_path": self._sorter_path.text().strip() or None,
-            # LH params merged with DEFAULT_PARAMS later
             "min_valid_count": self._min_valid_count.value(),
             "min_bl_bulk": self._min_bl_bulk.value(),
             "max_snippets": self._max_snippets.value(),
+            "min_trough": self._min_trough.value(),
+            "bin_width": self._bin_width.value(),
         }
         return params
 

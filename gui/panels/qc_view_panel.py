@@ -84,6 +84,21 @@ class QCViewPanel(QWidget):
     def show_result(self, result: QCResult):
         """Main entry point. Update all 4 plots and summary bar."""
         self._current_result = result
+        
+        # Intercept rejected channels
+        if result.reject_reason:
+            self._placeholder.setText(f"Channel {result.channel} Rejected: {result.reject_reason}")
+            self._placeholder.setStyleSheet("color: #F08080; font-size: 16px; font-weight: bold;")
+            self._placeholder.show()
+            self._update_summary_bar(result)
+            self._update_amp_histogram(result)
+            self._update_pca_scatter(result)
+            self._update_bltr_scatter(result)
+            self._update_waveforms(result)
+            self._update_summary_bar(result) 
+            return
+            
+        # Standard display for valid channels
         self._placeholder.hide()
         self._update_summary_bar(result)
         self._update_amp_histogram(result)
@@ -151,7 +166,6 @@ class QCViewPanel(QWidget):
         counts, edges = result.valley.amp_hist_counts, result.valley.amp_hist_edges
 
         # pyqtgraph with stepMode=True requires len(x) == len(y) + 1
-        # Pass the full edges array (length N+1), not the centers
         p.plot(
             edges,
             counts,
@@ -173,7 +187,14 @@ class QCViewPanel(QWidget):
         p.setTitle(f"Amplitude Histogram (CH {result.channel})")
         p.setLabel("bottom", "ADC amplitude")
         p.setLabel("left", "Count")
+        
+        # --- NEW CODE: Clamp the visual zoom ---
+        # Find the absolute minimum edge, but don't let the view zoom out further than -800
+        view_min = max(np.min(edges), -800)
+        p.setXRange(view_min, 0, padding=0)
 
+        p.setYRange(0, 2000, padding=0)
+        
     def _update_pca_scatter(self, result: QCResult):
         p = self._plot_pca
         p.clear()

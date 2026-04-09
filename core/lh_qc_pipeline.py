@@ -59,7 +59,11 @@ def _topk_mean_curve(sorted_desc):
 
 
 def _resolve_k_list(k_list, n_available):
-    return [int(k) for k in k_list if int(k) >= 1 and int(k) <= int(n_available)]
+    valid = [int(k) for k in k_list if int(k) >= 1 and int(k) <= int(n_available)]
+    # Fallback: if all requested k's are too large, just use all available spikes
+    if not valid and int(n_available) >= 1:
+        return [int(n_available)]
+    return valid
 
 
 def _support_metrics_from_curves(bl_curve, tr_curve, k_peak, k_bulk):
@@ -674,8 +678,8 @@ def verdict_from_kmeans(
 DEFAULT_PARAMS = dict(
     # Valley detection (fine-grained for low-amplitude units)
     window=(-20, 40),
-    bin_width=2.0,            # was 10.0
-    valley_bins=15,           # was 5
+    bin_width=10.0,            # was 10.0
+    valley_bins=3,           # was 5
     min_valid_count=50,       # was 900
     ratio_base=3,
     ratio_step=500,
@@ -749,7 +753,7 @@ def run_valley_detection(
         ch,
         window=tuple(params.get("window", (-40, 80))),
         bin_width=float(params.get("bin_width", 2.0)),
-        valley_bins=int(params.get("valley_bins", 15)),
+        valley_bins=int(params.get("valley_bins", 3)),
         min_valid_count=int(params.get("min_valid_count", 50)),
         ratio_base=int(params.get("ratio_base", 3)),
         ratio_step=int(params.get("ratio_step", 500)),
@@ -1131,7 +1135,7 @@ def run_qc_pipeline(
     left_times = valley.left_times
     if left_times.size >= 2:
         diffs = np.diff(np.sort(left_times))
-        isi_pairs = np.sum((diffs >= 0.01 * fs) & (diffs <= 0.03 * fs))  # 10-30 ms in samples
+        isi_pairs = np.sum(diffs < 0.002 * fs)  # 10-30 ms in samples
         if isi_pairs > isi_max:
             return _empty_qc_result(ch, n_sorter_spikes, valley, params, reason=f"isi_10_30>{isi_max}")
 
@@ -1193,7 +1197,7 @@ def _empty_qc_result(ch, n_sorter_spikes, valley, params, reason):
         counts={"LH":0,"soup":0,"uncertain_boundary":0,"uncertain_lowBL":0},
         times=np.array([], dtype=np.int64),
     )
-    # Override valley to indicate rejection reason (optional)
+    
     return QCResult(
         channel=ch,
         n_sorter_spikes=n_sorter_spikes,
@@ -1201,4 +1205,5 @@ def _empty_qc_result(ch, n_sorter_spikes, valley, params, reason):
         snippets=dummy_snippets,
         pca_km=dummy_pca,
         bltr=dummy_bltr,
+        reject_reason=reason,  # <-- Pass it here!
     )

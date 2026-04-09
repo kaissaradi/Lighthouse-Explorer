@@ -4,6 +4,7 @@ main_window.py — Top-level QMainWindow. Orchestrates panels and QC workflow.
 from __future__ import annotations
 from typing import Optional
 import numpy as np
+import os
 from qtpy.QtWidgets import QMainWindow, QSplitter, QStatusBar, QProgressBar, QPushButton, QMessageBox
 from qtpy.QtCore import Qt, QThread
 from .panels.load_panel import LoadPanel
@@ -113,6 +114,8 @@ class MainWindow(QMainWindow):
 
     def on_load_requested(self, params: dict):
         """Start background loading – supports both single .dat/.bin file and Litke bin folder."""
+        self.lh_params.update(params) 
+        
         dat_path = params.get("dat_path")
         if not dat_path:
             self._status_bar.showMessage("No .dat file or folder specified.")
@@ -120,7 +123,7 @@ class MainWindow(QMainWindow):
 
         # Abort any existing loader
         self._abort_loader()
-        self._load_panel.set_loading_state(True)~
+        self._load_panel.set_loading_state(True)
 
         # Check if this is a Litke folder (either flag or path is a directory)
         is_litke = params.get("is_litke_folder", False) or os.path.isdir(dat_path)

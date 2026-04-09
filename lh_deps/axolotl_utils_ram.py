@@ -2,19 +2,10 @@ import numpy as np
 import os
 from scipy.stats import trim_mean
 
-def compute_baselines_int16_deriv_robust(raw_data, segment_len=100_000, diff_thresh=50, trim_fraction=0.05):
+def compute_baselines_int16_deriv_robust(raw_data, segment_len=100_000, diff_thresh=50):
     """
     Compute mean baseline per channel over non-overlapping segments,
-    using derivative masking + trimmed mean to suppress spike influence.
-
-    Input:
-    - raw_data: [T, C], int16
-    - segment_len: samples per segment (default 100,000)
-    - diff_thresh: derivative threshold in raw units (default 50 µV/sample)
-    - trim_fraction: fraction to trim from both ends (default 5%)
-
-    Output:
-    - baselines: [C, n_segments] float32
+    using derivative masking (vectorized) to suppress spike influence.
     """
     total_samples, n_channels = raw_data.shape
     n_segments = (total_samples + segment_len - 1) // segment_len
@@ -27,24 +18,20 @@ def compute_baselines_int16_deriv_robust(raw_data, segment_len=100_000, diff_thr
         segment = raw_data[start:end, :]  # [S, C]
 
         if segment.shape[0] < 2:
-            baselines[:, seg_idx] = 0  # or np.nan
             continue
 
         # Compute absolute derivative
         diff_segment = np.abs(np.diff(segment, axis=0))  # [S-1, C]
-        # Pad to match original length
         diff_segment = np.vstack([diff_segment, diff_segment[-1]])  
 
-        # Mask: keep only low-derivative points
-        flat_mask = diff_segment < diff_thresh  # [S, C]
+        # Vectorized Masking: Keep low-derivative points, turn spikes into NaNs
+        masked_segment = np.where(diff_segment < diff_thresh, segment, np.nan)
 
-        # Apply mask and compute trimmed mean per channel
-        for c in range(n_channels):
-            flat_vals = segment[flat_mask[:, c], c].astype(np.float32)
-            if len(flat_vals) > 0:
-                baselines[c, seg_idx] = trim_mean(flat_vals, proportiontocut=trim_fraction)
-            else:
-                baselines[c, seg_idx] = 0  # fallback
+        # Compute the mean of the noise band across all channels simultaneously
+        b_vals = np.nanmean(masked_segment, axis=0)
+        
+        # Handle the rare case where an entire segment for a channel is NaNs
+        baselines[:, seg_idx] = np.nan_to_num(b_vals, nan=0.0)
 
     return baselines
 
