@@ -232,47 +232,128 @@ class QCViewPanel(QWidget):
         )
 
     def _update_fr_plot(self, result):
-        """Firing rate over time: LH spikes (green) vs sorter spikes (blue)."""
+        """KS fragmentation plot: for each LH spike, which KS unit claimed it?
+
+        Algorithm
+        ---------
+        1. Gather all LH spike times for this channel (left + rightk valley times).
+        2. Pool all KS spikes across units into a single sorted array, keeping a
+           parallel unit-ID array.
+        3. For each LH spike, binary-search for the nearest KS spike; if it falls
+           within the coincidence window (default ±1 ms) record its unit ID.
+        4. Plot a bar chart: x = KS unit ID (sorted by spike count desc), y = matched
+           spike count.  Append a "Missed" bar in red for unmatched LH spikes.
+        """
         p = self._plot_fr
         p.clear()
-        p.addLegend(offset=(10, 10))
 
         fs = getattr(result, 'fs', 20_000)
-        bin_s = 1.0  # 1-second bins
-        bin_samp = int(bin_s * fs)
+        coincidence_samp = int(0.001 * fs)  # ±1 ms in samples
 
-        lh_times = np.concatenate([
-            result.valley.left_times,
-            result.valley.rightk_times,
-        ]) if (result.valley.left_times.size + result.valley.rightk_times.size) > 0 else np.array([], dtype=np.int64)
+        # ── collect LH spike times ────────────────────────────────────────────
+        lh_times = np.array([], dtype=np.int64)
+        if hasattr(result, 'valley'):
+            parts = []
+            if result.valley.left_times.size:
+                parts.append(result.valley.left_times)
+            if result.valley.rightk_times.size:
+                parts.append(result.valley.rightk_times)
+            if parts:
+                lh_times = np.sort(np.concatenate(parts))
 
-        sorter_times = getattr(result, 'sorter_times', None)  # optional
+        sorter_unit_map: dict = getattr(result, 'sorter_unit_map', {})
 
-        # Determine total duration from whichever array is longest
-        all_times = lh_times
-        if sorter_times is not None and sorter_times.size > 0:
-            all_times = np.concatenate([all_times, sorter_times])
-        if all_times.size == 0:
-            p.setTitle("Firing Rate (no spikes)")
+        # ── no sorter data: show informative placeholder ──────────────────────
+        if not sorter_unit_map:
+            p.setTitle(f"KS Fragmentation — CH {result.channel} (no sorter loaded)")
+            p.setLabel("bottom", "KS unit / status")
+            p.setLabel("left", "LH spikes matched")
             return
 
-        n_bins = max(1, int(all_times.max() / bin_samp) + 1)
-        bins = np.arange(n_bins + 1, dtype=np.float64) * bin_s  # seconds
+        if lh_times.size == 0:
+            p.setTitle(f"KS Fragmentation — CH {result.channel} (no LH spikes)")
+            return
 
-        if lh_times.size > 0:
-            lh_counts, _ = np.histogram(lh_times / fs, bins=bins)
-            p.plot(bins[:-1], lh_counts.astype(np.float64),
-                   pen=pg.mkPen("#4CAF50", width=1.5), name="LH")
+        # ── pool KS spikes with unit labels ──────────────────────────────────
+        all_ks_times_list, all_ks_units_list = [], []
+        for uid, t in sorter_unit_map.items():
+            all_ks_times_list.append(t)
+            all_ks_units_list.append(np.full(len(t), uid, dtype=np.int64))
 
-        if sorter_times is not None and sorter_times.size > 0:
-            s_counts, _ = np.histogram(sorter_times / fs, bins=bins)
-            p.plot(bins[:-1], s_counts.astype(np.float64),
-                   pen=pg.mkPen("#2196F3", width=1.5), name="Sorter")
+        ks_times = np.concatenate(all_ks_times_list)  # pooled, unsorted
+        ks_units = np.concatenate(all_ks_units_list)
 
-        sorter_label = "" if (sorter_times is not None and sorter_times.size > 0) else " (no sorter)"
-        p.setTitle(f"Firing Rate — CH {result.channel}{sorter_label}")
-        p.setLabel("bottom", "Time (s)")
-        p.setLabel("left", "Spikes / s")
+        order = np.argsort(ks_times)
+        ks_times = ks_times[order]
+        ks_units = ks_units[order]
+
+        # ── match each LH spike to nearest KS spike within window ────────────
+        match_counts: dict[int, int] = {}
+        n_missed = 0
+
+        insert_idx = np.searchsorted(ks_times, lh_times)  # vectorised anchor
+
+        for i, (lh_t, idx) in enumerate(zip(lh_times, insert_idx)):
+            best_uid = None
+            best_dist = coincidence_samp + 1  # start outside window
+
+            # check left neighbour
+            if idx > 0:
+                d = abs(int(lh_t) - int(ks_times[idx - 1]))
+                if d < best_dist:
+                    best_dist = d
+                    best_uid = int(ks_units[idx - 1])
+
+            # check right neighbour
+            if idx < len(ks_times):
+                d = abs(int(lh_t) - int(ks_times[idx]))
+                if d < best_dist:
+                    best_dist = d
+                    best_uid = int(ks_units[idx])
+
+            if best_uid is not None and best_dist <= coincidence_samp:
+                match_counts[best_uid] = match_counts.get(best_uid, 0) + 1
+            else:
+                n_missed += 1
+
+        # ── build bar chart data ──────────────────────────────────────────────
+        # Sort matched units by count descending so the dominant unit is leftmost
+        sorted_units = sorted(match_counts.items(), key=lambda kv: -kv[1])
+
+        bar_labels: list[str] = [f"u{uid}" for uid, _ in sorted_units]
+        bar_counts: list[int] = [cnt for _, cnt in sorted_units]
+
+        if n_missed > 0:
+            bar_labels.append("Missed")
+            bar_counts.append(n_missed)
+
+        n_bars = len(bar_labels)
+        x = np.arange(n_bars, dtype=np.float64)
+
+        # Draw bars one by one so we can color "Missed" red
+        for i, (label, count) in enumerate(zip(bar_labels, bar_counts)):
+            color = "#F44336" if label == "Missed" else "#4CAF50"
+            bar = pg.BarGraphItem(
+                x=[x[i]], height=[count], width=0.7,
+                brush=pg.mkBrush(color),
+                pen=pg.mkPen("#1a1a1a", width=0.5),
+            )
+            p.addItem(bar)
+
+        # ── x-axis tick labels ────────────────────────────────────────────────
+        ax = p.getAxis("bottom")
+        ax.setTicks([[(xi, lbl) for xi, lbl in zip(x, bar_labels)]])
+
+        # ── title and axis labels ─────────────────────────────────────────────
+        win_ms = coincidence_samp * 1000 / fs
+        n_units_matched = len(match_counts)
+        p.setTitle(
+            f"KS Fragmentation — CH {result.channel}  "
+            f"({n_units_matched} unit{'s' if n_units_matched != 1 else ''} matched, "
+            f"±{win_ms:.0f} ms window)"
+        )
+        p.setLabel("bottom", "KS unit ID")
+        p.setLabel("left", "LH spikes matched")
 
     def _update_waveforms(self, result: QCResult):
         p = self._plot_waveforms

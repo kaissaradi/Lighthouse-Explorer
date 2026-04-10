@@ -28,7 +28,8 @@ class MainWindow(QMainWindow):
 
         # State
         self.raw_data = None  # np.memmap [T, C]
-        self.sorter_spike_times: dict = {}
+        self.sorter_spike_times: dict = {}   # {ch: times_array}  — flat, for FR plot / miss-rate
+        self.sorter_spike_units: dict = {}   # {ch: {unit_id: times_array}} — nested, for KS plot
         self.qc_results: dict = {}
         self.current_channel: Optional[int] = None
         self.lh_params: dict = dict(DEFAULT_PARAMS)
@@ -178,6 +179,7 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage("Loading sorter output…")
             n_ch = self.raw_data.shape[1] if self.raw_data is not None else 512
             self.sorter_spike_times = loader.load_sorter_spike_times(path, n_ch)
+            self.sorter_spike_units = loader.load_sorter_spike_units(path, n_ch)
 
             if self.sorter_spike_times:
                 duration_s = self.raw_data.shape[0] / self.lh_params.get("fs", 20_000)
@@ -234,10 +236,11 @@ class MainWindow(QMainWindow):
         self._channel_list.set_progress(current + 1, total, msg)
 
     def _attach_sorter_times(self, result: QCResult):
-        """Attach sorter spike times array to result for FR plot."""
+        """Attach sorter spike times and per-unit map to result for QC plots."""
         ch = result.channel
         times = self.sorter_spike_times.get(ch, None)
         result.sorter_times = times if times is not None else None
+        result.sorter_unit_map = self.sorter_spike_units.get(ch, {})  # {unit_id: times}
         result.fs = self.lh_params.get("fs", 20_000)
 
     def _on_batch_channel_done(self, result: QCResult):

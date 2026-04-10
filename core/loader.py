@@ -378,6 +378,30 @@ def load_sorter_spike_times(
     return {}
 
 
+def load_sorter_spike_units(
+    source_path: Optional[str], n_channels: int
+) -> dict[int, dict[int, np.ndarray]]:
+    """
+    Load sorted spike times keyed by channel *and* unit ID.
+
+    Returns
+    -------
+    {channel_idx: {unit_id: spike_times_array}}
+
+    Only Kilosort directories are supported (requires spike_times.npy +
+    spike_clusters.npy / spike_templates.npy + templates.npy).  Falls back to
+    an empty dict for any other path or missing files.
+    """
+    if not source_path:
+        return {}
+    source_path = source_path.strip()
+    if not os.path.exists(source_path):
+        return {}
+    if os.path.isdir(source_path):
+        return _load_kilosort_units(source_path, n_channels)
+    return {}
+
+
 def _load_kilosort_times(ks_dir: str, n_channels: int) -> dict[int, np.ndarray]:
     """Load spike times from a Kilosort output directory.
 
@@ -479,6 +503,108 @@ def _load_kilosort_times(ks_dir: str, n_channels: int) -> dict[int, np.ndarray]:
             result.setdefault(int(uid), []).extend(spike_times[mask].tolist())
 
     return {ch: np.array(times, dtype=np.int64) for ch, times in result.items()}
+
+
+def _load_kilosort_units(
+    ks_dir: str, n_channels: int
+) -> dict[int, dict[int, np.ndarray]]:
+    """
+    Like _load_kilosort_times but preserves the unit-ID dimension.
+
+    Returns
+    -------
+    {channel_idx: {unit_id: spike_times_array}}
+
+    Uses identical file-reading logic to _load_kilosort_times so that the
+    channel assignment is consistent.  The extra cost is negligible — all the
+    heavy numpy arrays are already in memory.
+    """
+    def _load(path):
+        return np.load(path).squeeze()
+
+    spike_times_path = os.path.join(ks_dir, "spike_times.npy")
+    if not os.path.isfile(spike_times_path):
+        return {}
+    spike_times = _load(spike_times_path).astype(np.int64)
+    if spike_times.ndim != 1 or spike_times.size == 0:
+        return {}
+
+    clusters_path = os.path.join(ks_dir, "spike_clusters.npy")
+    templates_path_spk = os.path.join(ks_dir, "spike_templates.npy")
+
+    spike_clusters = (
+        _load(clusters_path).astype(np.int64) if os.path.isfile(clusters_path) else None
+    )
+    spike_templates = (
+        _load(templates_path_spk).astype(np.int64)
+        if os.path.isfile(templates_path_spk)
+        else None
+    )
+
+    if spike_clusters is None and spike_templates is None:
+        return {}
+
+    spike_unit_ids = spike_clusters if spike_clusters is not None else spike_templates
+
+    # ── channel_map ───────────────────────────────────────────────────────────
+    channel_map = None
+    cm_path = os.path.join(ks_dir, "channel_map.npy")
+    if os.path.isfile(cm_path):
+        cm = _load(cm_path)
+        if cm.ndim == 2:
+            cm = cm[:, 0]
+        channel_map = cm.astype(int)
+
+    # ── peak channel per template ─────────────────────────────────────────────
+    peak_ch_per_template = None
+    tmpl_path = os.path.join(ks_dir, "templates.npy")
+    if os.path.isfile(tmpl_path):
+        tmpl = np.load(tmpl_path)          # [n_templates, T, C]
+        if tmpl.ndim == 3 and tmpl.shape[0] > 0:
+            ptp = tmpl.max(axis=1) - tmpl.min(axis=1)
+            peak_ch_per_template = ptp.argmax(axis=1).astype(int)
+            if channel_map is not None:
+                safe = np.clip(peak_ch_per_template, 0, len(channel_map) - 1)
+                peak_ch_per_template = channel_map[safe]
+
+    # ── assign each spike a probe channel ────────────────────────────────────
+    if peak_ch_per_template is not None:
+        n_tmpl = len(peak_ch_per_template)
+        if spike_clusters is not None and spike_templates is not None:
+            lookup: dict[int, int] = {}
+            for uid in np.unique(spike_clusters):
+                mask = spike_clusters == uid
+                tmpl_ids = spike_templates[mask]
+                most_common = int(
+                    np.bincount(np.clip(tmpl_ids, 0, n_tmpl - 1)).argmax()
+                )
+                lookup[int(uid)] = int(peak_ch_per_template[most_common])
+            spike_channels = np.array(
+                [lookup[int(u)] for u in spike_unit_ids], dtype=int
+            )
+        else:
+            safe_ids = np.clip(spike_unit_ids, 0, n_tmpl - 1)
+            spike_channels = peak_ch_per_template[safe_ids]
+    else:
+        # No templates — use unit ID as a proxy for channel (degraded mode)
+        spike_channels = spike_unit_ids.copy()
+
+    # ── build nested dict {ch: {uid: times}} ─────────────────────────────────
+    result: dict[int, dict[int, list]] = {}
+    for ch in np.unique(spike_channels):
+        ch_mask = spike_channels == ch
+        ch_units = spike_unit_ids[ch_mask]
+        ch_times = spike_times[ch_mask]
+        unit_dict: dict[int, list] = {}
+        for uid in np.unique(ch_units):
+            u_mask = ch_units == uid
+            unit_dict[int(uid)] = ch_times[u_mask].tolist()
+        result[int(ch)] = unit_dict
+
+    return {
+        ch: {uid: np.array(t, dtype=np.int64) for uid, t in units.items()}
+        for ch, units in result.items()
+    }
 
 
 def _load_lh_hdf5_times(h5_path: str, n_channels: int) -> dict[int, np.ndarray]:
