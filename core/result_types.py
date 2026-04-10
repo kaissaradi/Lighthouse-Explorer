@@ -62,6 +62,8 @@ class QCResult:
     pca_km: PCAKMeansResult
     bltr: BLTRResult
     reject_reason: Optional[str] = None   # added for early rejections
+    sorter_times: Optional[np.ndarray] = None  # spike times from sorter for FR plot
+    fs: float = 20_000.0                       # sampling rate, set by main_window
 
     @property
     def n_total(self) -> int:

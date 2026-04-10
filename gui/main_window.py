@@ -233,9 +233,17 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(msg)
         self._channel_list.set_progress(current + 1, total, msg)
 
+    def _attach_sorter_times(self, result: QCResult):
+        """Attach sorter spike times array to result for FR plot."""
+        ch = result.channel
+        times = self.sorter_spike_times.get(ch, None)
+        result.sorter_times = times if times is not None else None
+        result.fs = self.lh_params.get("fs", 20_000)
+
     def _on_batch_channel_done(self, result: QCResult):
         """A single channel QC completed during batch run."""
         ch = result.channel
+        self._attach_sorter_times(result)
         self.qc_results[ch] = result
         self._channel_list.update_channel_result(ch, result)
 
@@ -354,6 +362,7 @@ class MainWindow(QMainWindow):
     def on_single_qc_finished(self, result: QCResult):
         """Slot for single QCWorker.finished."""
         ch = result.channel
+        self._attach_sorter_times(result)
         self.qc_results[ch] = result
         self._qc_view.show_result(result)
         self._channel_list.update_channel_result(ch, result)

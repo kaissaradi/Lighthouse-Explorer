@@ -79,8 +79,8 @@ class LoadPanel(QWidget):
         # ── Sorter Output (optional) ───────────────────────────────
         sorter_grp = QGroupBox("Sorter Output (optional)")
         sorter_layout = QVBoxLayout()
-        self._sorter_path, self._sorter_btn = self._file_row(
-            sorter_layout, "KS dir / LH .h5", ""
+        self._sorter_path, self._sorter_btn = self._folder_row(
+            sorter_layout, "KS dir / LH .h5"
         )
         self._sorter_load_btn = QPushButton("Load Sorter")
         self._sorter_load_btn.clicked.connect(self._on_sorter_load)

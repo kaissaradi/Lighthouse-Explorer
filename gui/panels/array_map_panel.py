@@ -19,6 +19,22 @@ from qtpy.QtWidgets import (
 )
 
 
+class _ChannelListWidget(QListWidget):
+    """QListWidget that emits on arrow-key navigation in addition to clicks."""
+
+    channel_activated = Signal(int)  # emitted on arrow key move or Enter
+
+    def keyPressEvent(self, event):
+        super().keyPressEvent(event)  # let Qt move the selection first
+        key = event.key()
+        if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Return, Qt.Key_Enter):
+            item = self.currentItem()
+            if item is not None:
+                ch = item.data(Qt.UserRole)
+                if ch is not None:
+                    self.channel_activated.emit(int(ch))
+
+
 class ArrayMapPanel(QWidget):
     """Channel selector with groups: All / LH Found / Uncertain / No LH."""
 
@@ -35,7 +51,7 @@ class ArrayMapPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
-        # Top toolbar: group filter + search + Go
+        # Top toolbar
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("View:"))
         self._view_combo = QComboBox()
@@ -54,7 +70,7 @@ class ArrayMapPanel(QWidget):
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
-        # Progress bar (shown during batch QC)
+        # Progress bar
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
         self._progress_bar.setMaximumHeight(14)
@@ -66,9 +82,12 @@ class ArrayMapPanel(QWidget):
         self._progress_lbl.setVisible(False)
         layout.addWidget(self._progress_lbl)
 
-        # Channel list
-        self._channel_list = QListWidget()
+        # Channel list — custom subclass handles keyboard
+        self._channel_list = _ChannelListWidget()
+        self._channel_list.setFocusPolicy(Qt.StrongFocus)
+        self._channel_list.enterEvent = lambda e: self._channel_list.setFocus()
         self._channel_list.itemClicked.connect(self._on_item_clicked)
+        self._channel_list.channel_activated.connect(self.channel_selected)
         layout.addWidget(self._channel_list)
 
         # Status label
@@ -76,23 +95,18 @@ class ArrayMapPanel(QWidget):
         self._status_lbl.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self._status_lbl)
 
-    def set_array(self, ei_positions):
-        """
-        Populate channels after data load.
-        ei_positions: [C, 2] or [C, 1] — we use C (num channels).
-        """
-        import numpy as np
+    # ── public API ─────────────────────────────────────────────────
 
+    def set_array(self, ei_positions):
+        import numpy as np
         positions = np.asarray(ei_positions)
         self._n_channels = positions.shape[0]
         self._selected_ch = None
         self._qc_results.clear()
-
         self._status_lbl.setText(f"{self._n_channels} channels loaded.")
         self._rebuild_list()
 
     def set_progress(self, current: int, total: int, message: str = ""):
-        """Show progress during batch QC."""
         self._progress_bar.setVisible(True)
         self._progress_bar.setMaximum(total)
         self._progress_bar.setValue(current)
@@ -100,35 +114,60 @@ class ArrayMapPanel(QWidget):
         self._progress_lbl.setText(message or f"CH {current}/{total}")
 
     def hide_progress(self):
-        """Hide progress bar after batch QC completes."""
         self._progress_bar.setVisible(False)
         self._progress_lbl.setVisible(False)
 
     def update_channel_result(self, ch: int, result):
-        """Add a completed QC result and refresh the list."""
+        """Update a single channel's label+color without rebuilding the whole list."""
         self._qc_results[ch] = result
-        self._rebuild_list()
+        view = self._view_combo.currentText()
+
+        # Check if this channel should be visible in the current view
+        visible = self._ch_passes_filter(ch, result, view)
+
+        # Find existing item for this channel
+        existing_row = None
+        for i in range(self._channel_list.count()):
+            if self._channel_list.item(i).data(Qt.UserRole) == ch:
+                existing_row = i
+                break
+
+        if visible:
+            label, color = self._make_label_color(ch, result)
+            if existing_row is not None:
+                # Update in place — no clear(), selection preserved
+                item = self._channel_list.item(existing_row)
+                item.setText(label)
+                item.setForeground(QBrush(color))
+            else:
+                # New item — insert in channel-number order
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, ch)
+                item.setForeground(QBrush(color))
+                insert_pos = self._find_insert_pos(ch)
+                self._channel_list.insertItem(insert_pos, item)
+        else:
+            # Channel no longer passes filter — remove it
+            if existing_row is not None:
+                self._channel_list.takeItem(existing_row)
+
+        self._update_status()
 
     def set_qc_result_color(self, ch: int, miss_rate: Optional[float]):
-        """
-        Update a channel's display after QC. Called from main window.
-        We rebuild the whole list to keep grouping consistent.
-        """
-        # Just trigger a rebuild — colors are applied in _rebuild_list
-        self._rebuild_list()
+        result = self._qc_results.get(ch)
+        if result:
+            self.update_channel_result(ch, result)
 
     def set_selected_channel(self, ch: int):
-        """Highlight the selected channel in the list."""
         self._selected_ch = ch
         for i in range(self._channel_list.count()):
             item = self._channel_list.item(i)
             if item.data(Qt.UserRole) == ch:
-                item.setSelected(True)
+                self._channel_list.setCurrentItem(item)
                 self._channel_list.scrollToItem(item)
                 break
 
     def clear(self):
-        """Reset the channel list."""
         self._n_channels = 0
         self._selected_ch = None
         self._qc_results.clear()
@@ -136,69 +175,80 @@ class ArrayMapPanel(QWidget):
         self._status_lbl.setText("No recording loaded.")
         self.hide_progress()
 
-    # ── internal ───────────────────────────────────────────────────
+    # ── internals ──────────────────────────────────────────────────
+
+    def _ch_passes_filter(self, ch: int, result, view: str) -> bool:
+        if view == "All":
+            return True
+        if result is None:
+            return False
+        if view == "LH Found":
+            return result.n_lh > 0
+        if view == "Uncertain":
+            return result.n_uncertain > 0
+        if view == "No LH":
+            return result.n_lh == 0 and result.n_total > 0
+        return True
+
+    def _make_label_color(self, ch: int, result):
+        if result:
+            label = f"CH {ch} — {result.n_lh} LH, {result.n_soup} soup, {result.n_uncertain} unc"
+            lh_ratio = result.n_lh / result.n_total if result.n_total > 0 else 0
+            color = QColor(int(255 * (1.0 - lh_ratio)), int(255 * lh_ratio), 40)
+        else:
+            label = f"CH {ch} — pending"
+            color = QColor(136, 136, 136)
+        return label, color
+
+    def _find_insert_pos(self, ch: int) -> int:
+        """Binary-search for insertion index maintaining channel order."""
+        lo, hi = 0, self._channel_list.count()
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._channel_list.item(mid).data(Qt.UserRole) < ch:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
 
     def _get_group_channels(self) -> list[int]:
-        """Return channels matching current view filter."""
         view = self._view_combo.currentText()
         if view == "All":
             return list(range(self._n_channels))
-
         channels = []
         for ch in range(self._n_channels):
             result = self._qc_results.get(ch)
-            if result is None:
-                continue
-
-            n_lh = result.n_lh
-            n_total = result.n_total
-
-            if view == "LH Found":
-                if n_lh > 0:
-                    channels.append(ch)
-            elif view == "Uncertain":
-                if result.n_uncertain > 0:
-                    channels.append(ch)
-            elif view == "No LH":
-                if n_lh == 0 and n_total > 0:
-                    channels.append(ch)
-
+            if self._ch_passes_filter(ch, result, view):
+                channels.append(ch)
         return channels
 
     def _rebuild_list(self):
-        """Rebuild the channel list based on current view filter."""
+        """Full rebuild — only called on view-filter change or initial load."""
+        # Remember current item so we can restore it
+        cur_item = self._channel_list.currentItem()
+        cur_ch = cur_item.data(Qt.UserRole) if cur_item else self._selected_ch
+
+        self._channel_list.blockSignals(True)
         self._channel_list.clear()
         channels = self._get_group_channels()
-
         for ch in channels:
             result = self._qc_results.get(ch)
-            if result:
-                label = f"CH {ch} — {result.n_lh} LH, {result.n_soup} soup, {result.n_uncertain} unc"
-                # Color based on LH ratio
-                if result.n_total > 0:
-                    lh_ratio = result.n_lh / result.n_total
-                else:
-                    lh_ratio = 0
-                r = int(255 * (1.0 - lh_ratio))
-                g = int(255 * lh_ratio)
-                color = QColor(r, g, 40)
-            else:
-                label = f"CH {ch} — pending"
-                color = QColor(136, 136, 136)
-
+            label, color = self._make_label_color(ch, result)
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, ch)
             item.setForeground(QBrush(color))
             self._channel_list.addItem(item)
+        self._channel_list.blockSignals(False)
 
-        # Update status
-        shown = len(channels)
-        total = self._n_channels
-        self._status_lbl.setText(f"Showing {shown}/{total} channels.")
+        self._update_status()
 
-        # Re-select if current channel is visible
-        if self._selected_ch is not None:
-            self.set_selected_channel(self._selected_ch)
+        # Restore selection
+        if cur_ch is not None:
+            self.set_selected_channel(cur_ch)
+
+    def _update_status(self):
+        shown = self._channel_list.count()
+        self._status_lbl.setText(f"Showing {shown}/{self._n_channels} channels.")
 
     def _on_item_clicked(self, item: QListWidgetItem):
         ch = item.data(Qt.UserRole)
@@ -206,7 +256,6 @@ class ArrayMapPanel(QWidget):
             self.channel_selected.emit(int(ch))
 
     def _on_go(self):
-        """Jump to a specific channel by number."""
         text = self._ch_input.text().strip()
         if not text:
             return
@@ -214,15 +263,12 @@ class ArrayMapPanel(QWidget):
             ch = int(text)
         except ValueError:
             return
-
         if 0 <= ch < self._n_channels:
-            # Switch to "All" view so the channel is visible
             self._view_combo.setCurrentText("All")
             self._select_channel_by_index(ch)
             self._ch_input.clear()
 
     def _select_channel_by_index(self, ch: int):
-        """Programmatically select a channel and emit signal."""
         for i in range(self._channel_list.count()):
             item = self._channel_list.item(i)
             if item.data(Qt.UserRole) == ch:

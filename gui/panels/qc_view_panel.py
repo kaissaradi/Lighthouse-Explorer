@@ -50,17 +50,17 @@ class QCViewPanel(QWidget):
 
         self._plot_hist = pg.PlotWidget()
         self._plot_pca = pg.PlotWidget()
-        self._plot_bltr = pg.PlotWidget()
+        self._plot_fr = pg.PlotWidget()
         self._plot_waveforms = pg.PlotWidget()
 
         self._plot_hist.showGrid(x=True, y=True, alpha=0.15)
         self._plot_pca.showGrid(x=True, y=True, alpha=0.15)
-        self._plot_bltr.showGrid(x=True, y=True, alpha=0.15)
+        self._plot_fr.showGrid(x=True, y=True, alpha=0.15)
         self._plot_waveforms.showGrid(x=True, y=True, alpha=0.15)
 
         grid.addWidget(self._plot_hist, 0, 0)
         grid.addWidget(self._plot_pca, 0, 1)
-        grid.addWidget(self._plot_bltr, 1, 0)
+        grid.addWidget(self._plot_fr, 1, 0)
         grid.addWidget(self._plot_waveforms, 1, 1)
 
         # Set stretch — give equal weight
@@ -93,7 +93,7 @@ class QCViewPanel(QWidget):
             self._update_summary_bar(result)
             self._update_amp_histogram(result)
             self._update_pca_scatter(result)
-            self._update_bltr_scatter(result)
+            self._update_fr_plot(result)
             self._update_waveforms(result)
             self._update_summary_bar(result) 
             return
@@ -103,7 +103,7 @@ class QCViewPanel(QWidget):
         self._update_summary_bar(result)
         self._update_amp_histogram(result)
         self._update_pca_scatter(result)
-        self._update_bltr_scatter(result)
+        self._update_fr_plot(result)
         self._update_waveforms(result)
 
     def show_loading(self, channel: int):
@@ -136,7 +136,7 @@ class QCViewPanel(QWidget):
     def _clear_plots(self):
         for p in [
             self._plot_hist, self._plot_pca,
-            self._plot_bltr, self._plot_waveforms,
+            self._plot_fr, self._plot_waveforms,
         ]:
             p.clear()
 
@@ -231,49 +231,48 @@ class QCViewPanel(QWidget):
             f"PC2 ({evr[1]*100:.0f}%)" if evr.size > 1 else "PC2",
         )
 
-    def _update_bltr_scatter(self, result: QCResult):
-        p = self._plot_bltr
+    def _update_fr_plot(self, result):
+        """Firing rate over time: LH spikes (green) vs sorter spikes (blue)."""
+        p = self._plot_fr
         p.clear()
+        p.addLegend(offset=(10, 10))
 
-        bl = result.bltr.bl_bulk
-        tr = result.bltr.tr_bulk
-        labels = result.bltr.labels
-        if labels.size == 0:
-            p.setTitle("No spikes")
+        fs = getattr(result, 'fs', 20_000)
+        bin_s = 1.0  # 1-second bins
+        bin_samp = int(bin_s * fs)
+
+        lh_times = np.concatenate([
+            result.valley.left_times,
+            result.valley.rightk_times,
+        ]) if (result.valley.left_times.size + result.valley.rightk_times.size) > 0 else np.array([], dtype=np.int64)
+
+        sorter_times = getattr(result, 'sorter_times', None)  # optional
+
+        # Determine total duration from whichever array is longest
+        all_times = lh_times
+        if sorter_times is not None and sorter_times.size > 0:
+            all_times = np.concatenate([all_times, sorter_times])
+        if all_times.size == 0:
+            p.setTitle("Firing Rate (no spikes)")
             return
 
-        for label_name, color in [
-            ("LH", COLORS["LH"]),
-            ("soup", COLORS["soup"]),
-            ("uncertain_boundary", COLORS["uncertain_boundary"]),
-            ("uncertain_lowBL", COLORS["uncertain_lowBL"]),
-        ]:
-            mask = labels == label_name
-            if mask.any():
-                p.plot(
-                    bl[mask], tr[mask],
-                    pen=None,
-                    symbol="o",
-                    symbolSize=3,
-                    symbolBrush=pg.mkBrush(color),
-                    symbolPen=None,
-                )
+        n_bins = max(1, int(all_times.max() / bin_samp) + 1)
+        bins = np.arange(n_bins + 1, dtype=np.float64) * bin_s  # seconds
 
-        # Reference lines
-        min_bl = float(result.bltr.counts.get("min_bl_bulk", 0.70))
-        p.addItem(
-            pg.InfiniteLine(pos=min_bl, angle=90, pen=pg.mkPen("#5A5C65", style=Qt.DashLine))
-        )
-        p.addItem(
-            pg.InfiniteLine(pos=min_bl, angle=0, pen=pg.mkPen("#5A5C65", style=Qt.DashLine))
-        )
-        # Identity line
-        mx = max(bl.max() if bl.size else 1, tr.max() if tr.size else 1)
-        p.plot([0, mx], [0, mx], pen=pg.mkPen("#3D3F48", style=Qt.DashLine, width=1))
+        if lh_times.size > 0:
+            lh_counts, _ = np.histogram(lh_times / fs, bins=bins)
+            p.plot(bins[:-1], lh_counts.astype(np.float64),
+                   pen=pg.mkPen("#4CAF50", width=1.5), name="LH")
 
-        p.setTitle(f"BL/TR Scatter (CH {result.channel})")
-        p.setLabel("bottom", "BL_bulk")
-        p.setLabel("left", "TR_bulk")
+        if sorter_times is not None and sorter_times.size > 0:
+            s_counts, _ = np.histogram(sorter_times / fs, bins=bins)
+            p.plot(bins[:-1], s_counts.astype(np.float64),
+                   pen=pg.mkPen("#2196F3", width=1.5), name="Sorter")
+
+        sorter_label = "" if (sorter_times is not None and sorter_times.size > 0) else " (no sorter)"
+        p.setTitle(f"Firing Rate — CH {result.channel}{sorter_label}")
+        p.setLabel("bottom", "Time (s)")
+        p.setLabel("left", "Spikes / s")
 
     def _update_waveforms(self, result: QCResult):
         p = self._plot_waveforms

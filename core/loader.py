@@ -379,51 +379,106 @@ def load_sorter_spike_times(
 
 
 def _load_kilosort_times(ks_dir: str, n_channels: int) -> dict[int, np.ndarray]:
-    """Load spike times from Kilosort output directory.
+    """Load spike times from a Kilosort output directory.
 
-    Uses templates.npy to find each template's peak channel (channel with
-    max absolute PTP), then maps spikes to channels via spike_templates.npy.
-    Falls back to cluster-level peak channels if spike_templates.npy is missing.
+    Works with KS2 / KS2.5 / KS3 / KS4.
+
+    Files read
+    ----------
+    spike_times.npy      – [N] or [N,1] sample indices (required)
+    spike_clusters.npy   – [N] post-merge unit IDs (preferred)
+    spike_templates.npy  – [N] raw template indices (fallback)
+    templates.npy        – [n_templates, T, C] waveforms → peak channel per template
+    channel_map.npy      – [C] or [C,1] maps template-space channels to probe channels
+
+    Returns {channel_idx: spike_times_array}
     """
-    try:
-        spike_times = np.load(os.path.join(ks_dir, "spike_times.npy"))  # [N, 1]
-        spike_times = spike_times.squeeze().astype(np.int64)
+    def _load(path):
+        return np.load(path).squeeze()
 
-        spike_clusters_path = os.path.join(ks_dir, "spike_clusters.npy")
-        spike_templates_path = os.path.join(ks_dir, "spike_templates.npy")
-        templates_path = os.path.join(ks_dir, "templates.npy")
-
-        spike_clusters = np.load(spike_clusters_path).squeeze()  # [N]
-
-        # Load templates to find peak channels per template
-        templates = np.load(templates_path)  # [n_templates, n_timepoints, n_channels]
-        # Peak channel = channel with max PTP for each template
-        ptp_per_template = templates.ptp(axis=1)  # [n_templates, n_channels]
-        peak_ch_per_template = ptp_per_template.argmax(axis=1).astype(int)  # [n_templates]
-
-        result: dict[int, list] = {}
-
-        # Try to use spike_templates.npy for per-spike template mapping
-        if os.path.isfile(spike_templates_path):
-            spike_templates = np.load(spike_templates_path).squeeze()  # [N]
-            # Map each spike to its peak channel via its template
-            spike_channels = peak_ch_per_template[spike_templates]
-
-            for ch in np.unique(spike_channels):
-                mask = spike_channels == ch
-                times = spike_times[mask]
-                result[int(ch)] = times.tolist()
-        else:
-            # Fallback: assign each cluster to its template's peak channel.
-            # In KS2, cluster IDs == template IDs (one template per cluster).
-            for unit_id in np.unique(spike_clusters):
-                ch = int(peak_ch_per_template[unit_id]) if unit_id < len(peak_ch_per_template) else 0
-                times = spike_times[spike_clusters == unit_id]
-                result.setdefault(ch, []).extend(times.tolist())
-
-        return {ch: np.array(times, dtype=np.int64) for ch, times in result.items()}
-    except Exception:
+    # ── spike_times (required) ────────────────────────────────────────────────
+    spike_times_path = os.path.join(ks_dir, "spike_times.npy")
+    if not os.path.isfile(spike_times_path):
         return {}
+    spike_times = _load(spike_times_path).astype(np.int64)
+    if spike_times.ndim != 1 or spike_times.size == 0:
+        return {}
+
+    # ── per-spike unit assignment ─────────────────────────────────────────────
+    clusters_path  = os.path.join(ks_dir, "spike_clusters.npy")
+    templates_path_spk = os.path.join(ks_dir, "spike_templates.npy")
+
+    spike_clusters  = _load(clusters_path).astype(np.int64)  if os.path.isfile(clusters_path)      else None
+    spike_templates = _load(templates_path_spk).astype(np.int64) if os.path.isfile(templates_path_spk) else None
+
+    if spike_clusters is None and spike_templates is None:
+        return {}
+
+    # spike_clusters = post-merge IDs (preferred); spike_templates = raw template IDs
+    spike_unit_ids = spike_clusters if spike_clusters is not None else spike_templates
+
+    # ── channel_map ───────────────────────────────────────────────────────────
+    channel_map = None
+    cm_path = os.path.join(ks_dir, "channel_map.npy")
+    if os.path.isfile(cm_path):
+        cm = _load(cm_path)
+        if cm.ndim == 2:
+            cm = cm[:, 0]
+        channel_map = cm.astype(int)
+
+    # ── templates → peak channel per template ────────────────────────────────
+    peak_ch_per_template = None
+    tmpl_path = os.path.join(ks_dir, "templates.npy")
+    if os.path.isfile(tmpl_path):
+        tmpl = np.load(tmpl_path)          # [n_templates, T, C]
+        if tmpl.ndim == 3 and tmpl.shape[0] > 0:
+            # ptp removed in numpy 2.0 — use explicit max-min
+            ptp = tmpl.max(axis=1) - tmpl.min(axis=1)   # [n_templates, C]
+            peak_ch_per_template = ptp.argmax(axis=1).astype(int)  # [n_templates]
+            if channel_map is not None:
+                # map template-space channel indices → probe channel indices
+                safe = np.clip(peak_ch_per_template, 0, len(channel_map) - 1)
+                peak_ch_per_template = channel_map[safe]
+
+    # ── map spikes → probe channels ───────────────────────────────────────────
+    result: dict[int, list] = {}
+
+    if peak_ch_per_template is not None:
+        n_tmpl = len(peak_ch_per_template)
+
+        # For spike_clusters (post-merge) we need to find each cluster's peak channel.
+        # The cluster ID may not equal a template index directly, so we map via
+        # spike_templates when available, otherwise fall back to treating cluster IDs
+        # as template IDs (works for KS4 which doesn't rename them).
+        if spike_clusters is not None and spike_templates is not None:
+            # Build cluster → peak channel via the most common template for each cluster
+            lookup = {}
+            for uid in np.unique(spike_clusters):
+                mask = spike_clusters == uid
+                tmpl_ids = spike_templates[mask]
+                # most common template for this cluster
+                most_common = int(np.bincount(
+                    np.clip(tmpl_ids, 0, n_tmpl - 1)
+                ).argmax())
+                lookup[int(uid)] = int(peak_ch_per_template[most_common])
+            spike_channels = np.array([lookup[int(u)] for u in spike_unit_ids], dtype=int)
+        else:
+            # Only one of the two arrays exists — treat unit IDs as template IDs directly
+            safe_ids = np.clip(spike_unit_ids, 0, n_tmpl - 1)
+            spike_channels = peak_ch_per_template[safe_ids]
+
+        for ch in np.unique(spike_channels):
+            mask = spike_channels == ch
+            result[int(ch)] = spike_times[mask].tolist()
+
+    else:
+        # No templates.npy — group by unit ID (channel mapping will be wrong
+        # but at least spike counts per "unit" are preserved for miss-rate display)
+        for uid in np.unique(spike_unit_ids):
+            mask = spike_unit_ids == uid
+            result.setdefault(int(uid), []).extend(spike_times[mask].tolist())
+
+    return {ch: np.array(times, dtype=np.int64) for ch, times in result.items()}
 
 
 def _load_lh_hdf5_times(h5_path: str, n_channels: int) -> dict[int, np.ndarray]:
