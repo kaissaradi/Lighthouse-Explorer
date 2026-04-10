@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np
 import os
-from qtpy.QtWidgets import QMainWindow, QSplitter, QProgressBar, QPushButton, QMessageBox
+from qtpy.QtWidgets import QMainWindow, QSplitter, QStatusBar, QProgressBar, QPushButton, QMessageBox
 from qtpy.QtCore import Qt, QThread
 from .panels.load_panel import LoadPanel
 from .panels.array_map_panel import ArrayMapPanel
@@ -125,31 +125,13 @@ class MainWindow(QMainWindow):
         self._abort_loader()
         self._load_panel.set_loading_state(True)
 
-        # Check if this is a Litke folder (either flag or path is a directory)
-        is_litke = params.get("is_litke_folder", False) or os.path.isdir(dat_path)
-
-        if is_litke:
-            # --- Litke bin folder ---
-            try:
-                from core.loader import load_litke_folder
-                n_channels = params["n_channels"]
-                dtype = params.get("dtype", "int16")
-                raw_data = load_litke_folder(dat_path, n_channels, dtype)
-
-                self.raw_data = raw_data
-                self._load_panel.set_loading_state(False)
-                self._status_bar.showMessage(
-                    f"Loaded Litke folder: {dat_path} ({raw_data.shape[0]} samples, {n_channels} ch)"
-                )
-                # Start batch QC on the entire recording
-                self._start_batch_qc()
-            except ImportError:
-                self._on_loader_error("bin2py not installed. Run: pip install bin2py")
-            except Exception as e:
-                self._on_loader_error(f"Failed to load Litke folder: {e}")
-            return
-
-        # --- Single .dat/.bin file (Kilosort format) ---
+        # Both flat .dat/.bin files AND Litke folders go through LoaderWorker.
+        # LoaderWorker.run() detects the format via os.path.isdir() and handles both:
+        #   - flat file    -> np.memmap (copy-on-write) + in-place baseline subtraction
+        #   - Litke folder -> materialised (T, C) ndarray + in-place baseline subtraction
+        # Never short-circuit to the lazy LitkeMultiFileArray here — doing so skips
+        # baseline subtraction entirely and blocks the main thread on slow per-chunk
+        # reads, which freezes the UI and stalls batch QC on channel 0.
         self._loader_thread = QThread()
         self._loader_worker = LoaderWorker(
             dat_path=dat_path,
