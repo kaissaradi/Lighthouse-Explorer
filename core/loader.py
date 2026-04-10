@@ -379,21 +379,47 @@ def load_sorter_spike_times(
 
 
 def _load_kilosort_times(ks_dir: str, n_channels: int) -> dict[int, np.ndarray]:
-    """Load spike times from Kilosort output directory."""
+    """Load spike times from Kilosort output directory.
+
+    Uses templates.npy to find each template's peak channel (channel with
+    max absolute PTP), then maps spikes to channels via spike_templates.npy.
+    Falls back to cluster-level peak channels if spike_templates.npy is missing.
+    """
     try:
         spike_times = np.load(os.path.join(ks_dir, "spike_times.npy"))  # [N, 1]
-        spike_clusters = np.load(os.path.join(ks_dir, "spike_clusters.npy"))  # [N]
-        channel_map = np.load(os.path.join(ks_dir, "channel_map.npy"))  # [N_units]
-
         spike_times = spike_times.squeeze().astype(np.int64)
-        spike_clusters = spike_clusters.squeeze()
 
-        # Map each unit to its peak channel
+        spike_clusters_path = os.path.join(ks_dir, "spike_clusters.npy")
+        spike_templates_path = os.path.join(ks_dir, "spike_templates.npy")
+        templates_path = os.path.join(ks_dir, "templates.npy")
+
+        spike_clusters = np.load(spike_clusters_path).squeeze()  # [N]
+
+        # Load templates to find peak channels per template
+        templates = np.load(templates_path)  # [n_templates, n_timepoints, n_channels]
+        # Peak channel = channel with max PTP for each template
+        ptp_per_template = templates.ptp(axis=1)  # [n_templates, n_channels]
+        peak_ch_per_template = ptp_per_template.argmax(axis=1).astype(int)  # [n_templates]
+
         result: dict[int, list] = {}
-        for unit_id in np.unique(spike_clusters):
-            ch = int(channel_map[unit_id]) if unit_id < len(channel_map) else 0
-            times = spike_times[spike_clusters == unit_id]
-            result.setdefault(ch, []).extend(times.tolist())
+
+        # Try to use spike_templates.npy for per-spike template mapping
+        if os.path.isfile(spike_templates_path):
+            spike_templates = np.load(spike_templates_path).squeeze()  # [N]
+            # Map each spike to its peak channel via its template
+            spike_channels = peak_ch_per_template[spike_templates]
+
+            for ch in np.unique(spike_channels):
+                mask = spike_channels == ch
+                times = spike_times[mask]
+                result[int(ch)] = times.tolist()
+        else:
+            # Fallback: assign each cluster to its template's peak channel.
+            # In KS2, cluster IDs == template IDs (one template per cluster).
+            for unit_id in np.unique(spike_clusters):
+                ch = int(peak_ch_per_template[unit_id]) if unit_id < len(peak_ch_per_template) else 0
+                times = spike_times[spike_clusters == unit_id]
+                result.setdefault(ch, []).extend(times.tolist())
 
         return {ch: np.array(times, dtype=np.int64) for ch, times in result.items()}
     except Exception:

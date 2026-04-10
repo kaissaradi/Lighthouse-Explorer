@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np
 import os
-from qtpy.QtWidgets import QMainWindow, QSplitter, QStatusBar, QProgressBar, QPushButton, QMessageBox
+from qtpy.QtWidgets import QMainWindow, QSplitter, QStatusBar, QProgressBar, QPushButton
 from qtpy.QtCore import Qt, QThread
 from .panels.load_panel import LoadPanel
 from .panels.array_map_panel import ArrayMapPanel
@@ -63,26 +63,6 @@ class MainWindow(QMainWindow):
         self._load_panel = LoadPanel(self)
         self._channel_list = ArrayMapPanel(self)
         self._qc_view = QCViewPanel(self)
-
-        # Run All button
-        self._run_all_btn = QPushButton("▶ Run All Channels")
-        self._run_all_btn.setStyleSheet(
-            "QPushButton { background-color: #2E6DD4; color: white; font-weight: bold; padding: 6px; }"
-            "QPushButton:hover { background-color: #4A8BEF; }"
-            "QPushButton:disabled { background-color: #555; color: #888; }"
-        )
-        self._run_all_btn.clicked.connect(self._on_run_all_clicked)
-        self._load_panel.layout().insertWidget(self._load_panel.layout().count() - 1, self._run_all_btn)
-
-        # Cancel button (hidden initially)
-        self._cancel_btn = QPushButton("⏹ Cancel")
-        self._cancel_btn.setStyleSheet(
-            "QPushButton { background-color: #C62828; color: white; font-weight: bold; padding: 6px; }"
-            "QPushButton:hover { background-color: #E53935; }"
-        )
-        self._cancel_btn.setVisible(False)
-        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
-        self._load_panel.layout().insertWidget(self._load_panel.layout().count() - 1, self._cancel_btn)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._load_panel)
@@ -223,8 +203,6 @@ class MainWindow(QMainWindow):
         self._abort_batch_worker()
 
         self._running_batch = True
-        self._run_all_btn.setEnabled(False)
-        self._cancel_btn.setVisible(True)
         self._channel_list.hide_progress()
 
         self._batch_thread = QThread()
@@ -268,8 +246,6 @@ class MainWindow(QMainWindow):
     def _on_batch_finished(self, results: dict):
         """All channels completed."""
         self._running_batch = False
-        self._run_all_btn.setEnabled(True)
-        self._cancel_btn.setVisible(False)
         self._channel_list.hide_progress()
 
         # Count LH channels from our own dict
@@ -293,8 +269,6 @@ class MainWindow(QMainWindow):
     def _on_batch_error(self, msg: str):
         """Batch QC failed."""
         self._running_batch = False
-        self._run_all_btn.setEnabled(True)
-        self._cancel_btn.setVisible(False)
         self._channel_list.hide_progress()
         self._status_bar.showMessage(f"Batch QC failed: {msg}")
         self._qc_view.show_error(msg)
@@ -302,8 +276,6 @@ class MainWindow(QMainWindow):
     def _on_batch_aborted(self):
         """Batch QC was cancelled."""
         self._running_batch = False
-        self._run_all_btn.setEnabled(True)
-        self._cancel_btn.setVisible(False)
         self._channel_list.hide_progress()
         completed = len(self.qc_results)
         self._status_bar.showMessage(
@@ -311,33 +283,6 @@ class MainWindow(QMainWindow):
         )
 
     # ── Single QC run lifecycle ──────────────────────────────────
-
-    def _on_run_all_clicked(self):
-        """Manually trigger batch QC on all channels."""
-        if self.raw_data is None:
-            self._status_bar.showMessage("Load a recording first.")
-            return
-
-        # Confirm if some channels already have results
-        existing = len(self.qc_results)
-        total = self.raw_data.shape[1]
-        if existing > 0:
-            reply = QMessageBox.question(
-                self,
-                "Re-run All?",
-                f"{existing}/{total} channels already have results. Re-run all?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.No:
-                return
-
-        self.qc_results.clear()
-        self._start_batch_qc()
-
-    def _on_cancel_clicked(self):
-        """Cancel running batch QC."""
-        self._abort_batch_worker()
 
     def _abort_batch_worker(self):
         """Gracefully ask the batch worker to stop."""

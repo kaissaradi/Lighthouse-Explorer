@@ -701,7 +701,7 @@ DEFAULT_PARAMS = dict(
     # PCA / KMeans (on left spikes only)
     n_pcs=3,
     n_clusters=2,
-    n_left_spikes_for_pca=5000,      # subsample left spikes for speed
+    n_left_spikes_for_pca=999999,    # use all spikes (no subsampling)
     n_top_channels_for_pca=16,       # fixed top 16 (as you prefer)
     random_state=42,
 

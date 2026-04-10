@@ -76,18 +76,6 @@ class LoadPanel(QWidget):
         rec_grp.setLayout(rec_layout)
         layout.addWidget(rec_grp)
 
-        # ── Channel Map ────────────────────────────────────────────
-        map_grp = QGroupBox("Channel Map")
-        map_layout = QVBoxLayout()
-        self._map_path, self._map_btn = self._file_row(
-            map_layout, ".npy", ".npy"
-        )
-        map_layout.addWidget(
-            QLabel("(optional — fallback: linear layout)")
-        )
-        map_grp.setLayout(map_layout)
-        layout.addWidget(map_grp)
-
         # ── Sorter Output (optional) ───────────────────────────────
         sorter_grp = QGroupBox("Sorter Output (optional)")
         sorter_layout = QVBoxLayout()
@@ -116,14 +104,9 @@ class LoadPanel(QWidget):
         self._min_bl_bulk.setValue(0.70)
         self._add_row(param_layout, "min_bl_bulk", self._min_bl_bulk)
 
-        self._max_snippets = QSpinBox()
-        self._max_snippets.setRange(100, 100000)
-        self._max_snippets.setValue(5000)
-        self._add_row(param_layout, "max_snippets", self._max_snippets)
-
         self._min_trough = QSpinBox()
         self._min_trough.setRange(-5000, 0)
-        self._min_trough.setValue(-200)
+        self._min_trough.setValue(-2000)
         self._add_row(param_layout, "min_trough", self._min_trough)
 
         self._bin_width = QDoubleSpinBox()
@@ -177,13 +160,17 @@ class LoadPanel(QWidget):
 
     @staticmethod
     def _browse_file(line_edit: QLineEdit, ext: str):
-        if ext:
+        if ext == ".npy":
+            path, _ = QFileDialog.getOpenFileName(
+                None, "Select File", "", "Numpy Files (*.npy);;All Files (*)"
+            )
+        elif ext:
             path, _ = QFileDialog.getOpenFileName(
                 None, "Select File", "", "Data Files (*.dat *.bin);;All Files (*)"
             )
         else:
-            path = QFileDialog.getExistingDirectory(
-                None, "Select Directory"
+            path, _ = QFileDialog.getOpenFileName(
+                None, "Select File", "", "All Files (*)"
             )
         if path:
             line_edit.setText(path)
@@ -237,11 +224,9 @@ class LoadPanel(QWidget):
             "fs": self._fs.value(),
             "start_min": self._start_min.value(),
             "duration_min": dur if dur > 0 else None,
-            "map_path": self._map_path.text().strip() or None,
             "sorter_path": self._sorter_path.text().strip() or None,
             "min_valid_count": self._min_valid_count.value(),
-            "min_bl_bulk": self._min_bl_bulk.value(),
-            "max_snippets": self._max_snippets.value(),
+            "support_min_bl_bulk": self._min_bl_bulk.value(),
             "min_trough": self._min_trough.value(),
             "bin_width": self._bin_width.value(),
         }
