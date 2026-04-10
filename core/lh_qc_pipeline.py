@@ -13,18 +13,14 @@ All fixes applied:
 from __future__ import annotations
 from typing import Optional, Tuple
 import numpy as np
-import math
-from collections import defaultdict
 
 # ── Imports from notebook helpers ───────────────────────────────────────────
 try:
     from lh_deps.lighthouse_utils import find_valley_and_times
     from lh_deps.axolotl_utils_ram import extract_snippets_fast_ram
-    from lh_deps.collision_utils import median_ei_adaptive
 except ImportError:
     from lighthouse_utils import find_valley_and_times
     from axolotl_utils_ram import extract_snippets_fast_ram
-    from collision_utils import median_ei_adaptive
 
 from .result_types import (
     ValleyResult,
@@ -307,7 +303,7 @@ def choose_adaptive_km_window(
     else:
         pick = left_times
 
-    snips_probe, valid_probe = extract_snippets_fast_ram(
+    snips_probe, _ = extract_snippets_fast_ram(
         raw_data,
         pick,
         window=probe_win,
@@ -457,7 +453,7 @@ def kmeans_precheck_decision(
             verdict="TWO-UNITS-like (PC variance)",
             reason="pc_var",
             detail=(
-                f"expl_var=[" + ", ".join(f"{100.0 * float(v):.2f}%" for v in vr12[:2]) + "] "
+                "expl_var=[" + ", ".join(f"{100.0 * float(v):.2f}%" for v in vr12[:2]) + "] "
                 f"> {100.0 * float(pc_var_thr):.1f}%"
             ),
             pair=None,
@@ -586,7 +582,7 @@ def verdict_from_kmeans(
         return best
 
     def containment_metrics(X, Y, max_lag, support_rel, support_abs, time_keep_rel):
-        S, p2pX, thr = support_from_ei(X, support_rel, support_abs)
+        S, _, thr = support_from_ei(X, support_rel, support_abs)
         best = best_lag_on_support(X, Y, S, max_lag, time_keep_rel)
         lag = best["lag"]
         Yal = shift_ei(Y, lag)
@@ -781,22 +777,6 @@ def run_valley_detection(
     )
 
 
-def compute_left_isi_pairs_10_30(valley: ValleyResult) -> int:
-    """Return number of left-spike pairs with ISI between 10 and 30 ms."""
-    lt = np.sort(valley.left_times)
-    if lt.size < 2:
-        return 0
-    d = np.diff(lt)
-    # Assume 20 kHz sampling -> 10 samples = 0.5 ms? Actually 10 ms = 200 samples at 20k.
-    # The notebook uses sample indices, so we need to know fs. We'll pass fs as param.
-    # For now, assume default 20 kHz. We'll get fs from params later.
-    # Better: store fs in params. We'll add a 'fs' parameter.
-    # But to keep simple, we'll compute in samples: 10 ms = 0.01 * fs, 30 ms = 0.03 * fs.
-    # We'll assume fs is passed. For now, return 0 and log warning.
-    # Actually we'll modify run_qc_pipeline to pass fs.
-    return 0  # Placeholder; will be implemented in run_qc_pipeline
-
-
 def run_pca_kmeans_on_left_spikes(
     raw_data: np.ndarray,
     left_times: np.ndarray,
@@ -930,7 +910,6 @@ def run_pca_kmeans_on_left_spikes(
         proceed = bool(precheck["proceed"])
         reason = precheck["reason"]
         detail = precheck["detail"]
-        called_verdict = False
         shared_core = None
     else:
         verdict_info = verdict_from_kmeans(

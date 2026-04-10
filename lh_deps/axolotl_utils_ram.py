@@ -1,6 +1,5 @@
 import numpy as np
 import os
-from scipy.stats import trim_mean
 
 def compute_baselines_int16_deriv_robust(raw_data, segment_len=100_000, diff_thresh=50):
     """

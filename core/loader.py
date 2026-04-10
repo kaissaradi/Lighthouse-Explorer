@@ -166,6 +166,89 @@ def load_litke_folder(
     return LitkeMultiFileArray(folder_path, n_channels, np.dtype(dtype))
 
 
+def load_litke_as_writable_array(
+    folder_path: str,
+    n_channels: int,
+    dtype: str = "int16",
+    start_min: float = 0.0,
+    duration_min: float | None = None,
+    fs: int = 20_000,
+    chunk_samples: int = 100_000,
+    progress_cb=None,
+) -> np.ndarray:
+    """
+    Read a Litke .bin folder into a contiguous, writable (T, C) int16 array.
+
+    This is the Litke equivalent of load_raw_readonly(..., writable=True).
+    Unlike LitkeMultiFileArray (lazy/read-only), the returned array is a plain
+    numpy ndarray that supports in-place operations such as baseline subtraction.
+
+    The TTL channel (index 0 in the raw files) is stripped automatically,
+    matching the behaviour of LitkeMultiFileArray.
+
+    Parameters
+    ----------
+    folder_path : str
+        Path to the folder containing chronological Litke .bin files.
+    n_channels : int
+        Number of real electrode channels (excluding TTL).
+    dtype : str
+        NumPy dtype string (default "int16").
+    start_min : float
+        Start offset in minutes (default 0.0).
+    duration_min : float | None
+        Duration to load in minutes. None = load to end of recording.
+    fs : int
+        Sampling rate in Hz (default 20 000).
+    chunk_samples : int
+        Number of samples to read per iteration. Tune for RAM vs speed.
+        Default 100 000 (~5 s at 20 kHz, ~100 MB for 512 ch int16).
+    progress_cb : callable | None
+        Optional callback(n_loaded, n_total) called after each chunk.
+        Use this to drive a progress bar without polling.
+
+    Returns
+    -------
+    np.ndarray of shape (T, C) and dtype int16.
+        Fully in-memory, writable. Baseline subtraction can be applied
+        in-place just like a copy-on-write memmap.
+    """
+    if not _BIN2PY_AVAILABLE:
+        raise ImportError("bin2py is required for Litke folder support.")
+    if not os.path.isdir(folder_path):
+        raise NotADirectoryError(f"{folder_path} is not a directory")
+
+    reader = bin2py.PyBinFileReader(folder_path, is_row_major=True)
+    total_samples = reader.length
+
+    # Resolve the sample window
+    start_sample = int(start_min * 60.0 * fs)
+    start_sample = max(0, min(start_sample, total_samples))
+
+    if duration_min is not None and duration_min > 0:
+        n_samples = int(duration_min * 60.0 * fs)
+    else:
+        n_samples = total_samples - start_sample
+    n_samples = max(1, min(n_samples, total_samples - start_sample))
+
+    # Allocate the output buffer once
+    out = np.empty((n_samples, n_channels), dtype=np.dtype(dtype))
+
+    # Read in chunks: bin2py returns (n_total_channels, chunk_size) col-major
+    n_loaded = 0
+    while n_loaded < n_samples:
+        this_chunk = min(chunk_samples, n_samples - n_loaded)
+        block = reader.get_data(start_sample + n_loaded, this_chunk)
+        # block shape: (n_total_elec, this_chunk)  — TTL is row 0
+        # Strip TTL, transpose to (this_chunk, n_channels)
+        out[n_loaded : n_loaded + this_chunk, :] = block[1:, :].T.astype(np.dtype(dtype))
+        n_loaded += this_chunk
+        if progress_cb is not None:
+            progress_cb(n_loaded, n_samples)
+
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Existing functions below – unchanged
 # ──────────────────────────────────────────────────────────────────────────────

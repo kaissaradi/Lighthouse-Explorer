@@ -1,6 +1,10 @@
 # Lighthouse QC — Standalone GUI
 
-A standalone PyQt5/qtpy application that loads a raw `.dat`/`.bin` recording, lets the user browse the electrode array spatially, picks a channel, and runs the full 4-step Lighthouse QC pipeline (valley detection → snippet extraction → PCA/KMeans → BL/TR labeling) **without any subtraction**. The output is a pure visualization: how many threshold crossings look like clean LH spikes vs. soup vs. uncertain, compared to what the sorter already called. No KS dependency. Standalone executable entry point.
+A standalone PyQt5/qtpy application that loads a raw `.dat`/`.bin` recording or Litke folder, lets the user browse the electrode array spatially, picks a channel, and runs the full 4-step Lighthouse QC pipeline (valley detection → snippet extraction → PCA/KMeans → BL/TR labeling). 
+
+For **Kilosort-format single files**, the app automatically subtracts baselines (using derivative-robust baseline estimation) before running the QC pipeline. For **Litke-format folders**, data is loaded as-is without baseline subtraction (since preprocessing is typically done upstream).
+
+The output is a pure visualization: how many threshold crossings look like clean LH spikes vs. soup vs. uncertain, compared to what the sorter already called. No KS dependency. Standalone executable entry point.
 
 ## Setup
 

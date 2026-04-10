@@ -4,7 +4,7 @@ array_map_panel.py — Channel selector with grouped views and progress bar.
 from __future__ import annotations
 from typing import Optional
 from qtpy.QtCore import Signal, Qt
-from qtpy.QtGui import QColor, QBrush, QFont
+from qtpy.QtGui import QColor, QBrush
 from qtpy.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -126,10 +126,6 @@ class ArrayMapPanel(QWidget):
                 item.setSelected(True)
                 self._channel_list.scrollToItem(item)
                 break
-
-    def set_firing_rates(self, fr_values: dict[int, float]):
-        """Not used — no-op."""
-        pass
 
     def clear(self):
         """Reset the channel list."""

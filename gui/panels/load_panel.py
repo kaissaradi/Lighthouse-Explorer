@@ -7,7 +7,7 @@ from typing import Optional
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QSpinBox, QDoubleSpinBox,
-    QComboBox, QFileDialog, QRadioButton, QButtonGroup,
+    QFileDialog, QRadioButton,
 )
 from qtpy.QtCore import Signal
 
@@ -179,7 +179,7 @@ class LoadPanel(QWidget):
     def _browse_file(line_edit: QLineEdit, ext: str):
         if ext:
             path, _ = QFileDialog.getOpenFileName(
-                None, "Select File", "", f"Data Files (*.dat *.bin);;All Files (*)"
+                None, "Select File", "", "Data Files (*.dat *.bin);;All Files (*)"
             )
         else:
             path = QFileDialog.getExistingDirectory(

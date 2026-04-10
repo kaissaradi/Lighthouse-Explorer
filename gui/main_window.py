@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np
 import os
-from qtpy.QtWidgets import QMainWindow, QSplitter, QStatusBar, QProgressBar, QPushButton, QMessageBox
+from qtpy.QtWidgets import QMainWindow, QSplitter, QProgressBar, QPushButton, QMessageBox
 from qtpy.QtCore import Qt, QThread
 from .panels.load_panel import LoadPanel
 from .panels.array_map_panel import ArrayMapPanel

@@ -4,7 +4,6 @@ qc_worker.py — Background worker for QC pipeline execution.
 from __future__ import annotations
 from qtpy.QtCore import QObject, Signal
 from core.lh_qc_pipeline import run_qc_pipeline, DEFAULT_PARAMS
-from core.result_types import QCResult
 
 
 class QCWorker(QObject):

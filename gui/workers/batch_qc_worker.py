@@ -4,7 +4,6 @@ batch_qc_worker.py — Runs QC pipeline on all channels in the background.
 from __future__ import annotations
 from qtpy.QtCore import QObject, Signal
 from core.lh_qc_pipeline import run_qc_pipeline, DEFAULT_PARAMS
-from core.result_types import QCResult
 
 
 class BatchQCWorker(QObject):

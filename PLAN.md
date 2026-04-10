@@ -2,48 +2,64 @@ pl# Lighthouse QC — Standalone GUI: Development Plan
 
 ## Overview
 
-A standalone PyQt5/qtpy application that loads a raw `.dat`/`.bin` recording, lets the
-user browse the electrode array spatially, picks a channel, and runs the full
-4-step Lighthouse QC pipeline (valley detection → snippet extraction → PCA/KMeans →
-BL/TR labeling) **without any subtraction or writing**. The output is a pure
-visualization: how many threshold crossings look like clean LH spikes vs. soup vs.
-uncertain, compared to what the sorter already called. No KS dependency. Standalone
-executable entry point.
+A standalone PyQt5/qtpy application that loads a raw `.dat`/`.bin` recording or Litke folder, lets the user browse channels spatially, picks a channel, and runs the full 4-step Lighthouse QC pipeline (valley detection → snippet extraction → PCA/KMeans → BL/TR labeling).
+
+For **Kilosort-format single files**, the app automatically subtracts baselines before running QC. For **Litke-format folders**, data is loaded as-is (preprocessing done upstream). The output is a pure visualization: how many threshold crossings look like clean LH spikes vs. soup vs. uncertain, compared to what the sorter already called. No KS dependency. Standalone executable entry point.
 
 ---
 
 ## Current Status
 
-### Completed
-- Directory structure created: `lighthouse_qc/` with all subdirectories (`core/`, `gui/`, `gui/panels/`, `gui/workers/`, `lh_deps/`)
-- `requirements.txt`: Dependencies listed as per plan (numpy, scipy, scikit-learn, pyqtgraph, qtpy, PyQt5, h5py)
-- `README.md`: Setup instructions for conda environment creation and dependency installation
-- `run.py`: Entry point with CLI argument parsing for default paths
-- All `__init__.py` files created (mostly empty)
-- `core/result_types.py`: Full implementation of all dataclasses (ValleyResult, SnippetResult, PCAKMeansResult, BLTRResult, QCResult) with properties
+### ✅ COMPLETED (All Core Features)
+
+- **Directory structure**: Fully implemented with all subdirectories
+- **requirements.txt**: Dependencies (numpy, pandas, scipy, scikit-learn, numba, matplotlib, pyqtgraph, qtpy, PyQt5, h5py)
+- **README.md**: Setup instructions with baseline subtraction clarification
+- **run.py**: Entry point with CLI argument parsing
+- **core/result_types.py**: Full dataclass implementation (ValleyResult, SnippetResult, PCAKMeansResult, BLTRResult, QCResult)
+- **core/loader.py**: Raw data loading + Litke folder support (LitkeMultiFileArray)
+- **core/lh_qc_pipeline.py**: Full 4-step pipeline with adaptive windows, K-means precheck, BL/TR support labeling, early rejection logic
+- **gui/app.py**: QApplication setup with dark Fusion theme
+- **gui/main_window.py**: Main window with full QC workflow orchestration (single + batch QC)
+- **gui/panels/load_panel.py**: Load panel with Kilosort/Litke source type selection
+- **gui/panels/array_map_panel.py**: Channel list with view filters (All/LH Found/Uncertain/No LH)
+- **gui/panels/qc_view_panel.py**: 4 pyqtgraph plots + summary bar
+- **gui/workers/qc_worker.py**: Single-channel background QC execution
+- **gui/workers/batch_qc_worker.py**: Batch QC across all channels with progress tracking
+- **gui/workers/loader_worker.py**: Background data loading + baseline subtraction
+- **lh_deps/**: All vendored utility files populated
+
+### 🔧 Code Quality Improvements (2026-04-09)
+
+- Removed dead stub function `compute_left_isi_pairs_10_30()`
+- Removed unused no-op method `set_firing_rates()`
+- Cleaned up 9 unused imports across 7 files
+- Removed 4 unused variables
+- Fixed f-string issues
+- Updated README to clarify baseline subtraction behavior
+- All static analysis checks pass (pyflakes: 0 issues, vulture: 1 acceptable deprecated parameter)
 
 ### Remaining Tasks
-- `core/loader.py`: Implement data loading functions (load_raw_readonly, load_channel_map, load_sorter_spike_times, compute_channel_firing_rates)
-- `core/lh_qc_pipeline.py`: Implement the 4-step QC pipeline functions (run_valley_detection, run_snippet_extraction, run_pca_kmeans, run_bltr_labeling, run_qc_pipeline)
-- `gui/app.py`: Implement QApplication setup, dark stylesheet, and run function
-- `gui/main_window.py`: Implement the main window layout, signal connections, and QC workflow orchestration
-- `gui/panels/load_panel.py`: Implement the load panel UI with file browsers and parameter inputs
-- `gui/panels/array_map_panel.py`: Implement the electrode array map with clickable channels and coloring modes
-- `gui/panels/qc_view_panel.py`: Implement the QC visualization panel with 4 pyqtgraph plots and summary stats
-- `gui/workers/qc_worker.py`: Implement the background worker for QC pipeline execution
-- `lh_deps/` files: Copy `lighthouse_utils.py`, `axolotl_utils_ram.py`, `collision_utils.py`, `joint_utils.py` from axolotl codebase (currently empty skeletons)
+- Rename `ArrayMapPanel` → `ChannelListPanel` (currently implements list, not spatial map)
+- Consider exposing more pipeline parameters in UI (currently only 5 exposed)
+- Add unit tests for core pipeline functions
+- Implement actual spatial electrode map (currently just a channel list)
 
 ### Implementation Order (Updated)
-1. ✅ `core/result_types.py` — dataclasses, no deps, test immediately
-2. `core/loader.py` — test with a real `.dat` file
-3. `lh_deps/` — copy utility files, verify imports work
-4. `core/lh_qc_pipeline.py` — implement and unit-test each step function in isolation
-5. `gui/app.py` + `gui/main_window.py` skeleton — get window to open
-6. `gui/panels/load_panel.py` — get load flow working end to end
-7. `gui/panels/array_map_panel.py` — get array rendering + click working
-8. `gui/workers/qc_worker.py` — wire background execution
-9. `gui/panels/qc_view_panel.py` — implement plots one at a time (hist → PCA → BLTR → waveforms)
-10. Integration test: full run on a real dataset
+1. ✅ `core/result_types.py` — dataclasses, no deps
+2. ✅ `core/loader.py` — raw data loading + Litke support
+3. ✅ `lh_deps/` — vendored utility files (lighthouse_utils, axolotl_utils_ram, collision_utils, joint_utils)
+4. ✅ `core/lh_qc_pipeline.py` — full 4-step pipeline with adaptive windows and BL/TR
+5. ✅ `gui/app.py` — QApplication setup with dark theme
+6. ✅ `gui/main_window.py` — single + batch QC orchestration
+7. ✅ `gui/panels/load_panel.py` — Kilosort/Litke source selection
+8. ✅ `gui/panels/array_map_panel.py` — channel list with view filters
+9. ✅ `gui/workers/qc_worker.py` — single channel background execution
+10. ✅ `gui/workers/batch_qc_worker.py` — batch QC with progress tracking
+11. ✅ `gui/workers/loader_worker.py` — background loading + baseline subtraction
+12. ✅ `gui/panels/qc_view_panel.py` — 4 pyqtgraph plots + summary bar
+13. ⏳ Integration testing on real datasets
+14. ⏳ Unit tests for core functions
 
 ---
 
@@ -53,36 +69,38 @@ executable entry point.
 lighthouse_qc/
 │
 ├── README.md
-├── requirements.txt              # pyqt5/qtpy, pyqtgraph, numpy, scipy, scikit-learn, h5py
+├── requirements.txt              # pyqt5/qtpy, pyqtgraph, numpy, scipy, scikit-learn, h5py, pandas, numba, matplotlib
 ├── run.py                        # entry point: `python run.py`
 │
 ├── core/                         # pure-Python, NO Qt — all the science lives here
 │   ├── __init__.py
-│   ├── loader.py                 # raw data loading (adapted from axolotl/io.py)
+│   ├── loader.py                 # raw data loading (adapted from axolotl/io.py) + LitkeMultiFileArray
 │   ├── lh_qc_pipeline.py         # the 4-step QC pipeline for a single channel
 │   └── result_types.py           # dataclasses for pipeline outputs
 │
 ├── gui/
 │   ├── __init__.py
-│   ├── app.py                    # QApplication setup, theme, entry
+│   ├── app.py                    # QApplication setup, dark Fusion theme, entry
 │   ├── main_window.py            # top-level QMainWindow, layout orchestration
 │   │
 │   ├── panels/
 │   │   ├── __init__.py
-│   │   ├── load_panel.py         # left sidebar: file paths, params, Load button
-│   │   ├── array_map_panel.py    # electrode array spatial map (clickable channels)
+│   │   ├── load_panel.py         # left sidebar: file paths, params, Load button (Kilosort/Litke)
+│   │   ├── array_map_panel.py    # channel list with view filters (All/LH/Uncertain/No LH)
 │   │   └── qc_view_panel.py      # right side: 4 pyqtgraph plots + summary stats
 │   │
 │   └── workers/
 │       ├── __init__.py
-│       └── qc_worker.py          # QObject worker for background pipeline execution
+│       ├── qc_worker.py          # QObject worker for single channel QC execution
+│       ├── batch_qc_worker.py    # QObject worker for batch QC across all channels
+│       └── loader_worker.py      # QObject worker for background loading + baseline subtraction
 │
 └── lh_deps/                      # vendored copies of LH utility deps
     ├── __init__.py
-    ├── lighthouse_utils.py       # COPY of lighthouse_utils.py (provided)
-    ├── axolotl_utils_ram.py      # COPY — only extract_snippets_fast_ram needed
-    ├── collision_utils.py        # COPY — only median_ei_adaptive needed
-    └── joint_utils.py            # COPY — only cosine_two_eis needed
+    ├── lighthouse_utils.py       # COPY of lighthouse_utils.py (find_valley_and_times)
+    ├── axolotl_utils_ram.py      # COPY — extract_snippets_fast_ram + baseline subtraction
+    ├── collision_utils.py        # COPY — median_ei_adaptive
+    └── joint_utils.py            # COPY — cosine_two_eis (for future use)
 ```
 
 **Key decision on `lh_deps/`:** Rather than requiring the user to have the full axolotl
