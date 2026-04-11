@@ -20,7 +20,7 @@ class ValleyResult:
     amp_hist_edges: np.ndarray
     left_count: int
     valley_count: int
-    rightk_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))  # added
+    rightk_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
 
 @dataclass
@@ -61,9 +61,30 @@ class QCResult:
     snippets: SnippetResult
     pca_km: PCAKMeansResult
     bltr: BLTRResult
-    reject_reason: Optional[str] = None   # added for early rejections
-    sorter_times: Optional[np.ndarray] = None  # spike times from sorter for FR plot
-    fs: float = 20_000.0                       # sampling rate, set by main_window
+    reject_reason: Optional[str] = None         # set on early pipeline rejection
+    sorter_times: Optional[np.ndarray] = None   # spike times from sorter, attached by main_window
+    fs: float = 20_000.0                        # sampling rate, set by main_window
+
+    # ── KMeans verdict info ──────────────────────────────────────────────────
+    # Populated by run_pca_kmeans_on_left_spikes. Keys:
+    #   proceed      : bool   — whether pipeline continued past KMeans
+    #   verdict      : str    — e.g. 'single_unit', 'two_unit_reject', 'low_n'
+    #   cos_sim      : float  — cosine similarity between cluster mean waveforms
+    #   n_spikes     : int    — number of spikes fed into KMeans
+    #   cluster_sizes: list[int]
+    km_info: dict = field(default_factory=dict)
+
+    # ── Biophysics payload ───────────────────────────────────────────────────
+    # Populated by compute_biophysics() at the end of run_qc_pipeline. Keys:
+    #   firing_rate_hz      : float  — mean FR over recording duration
+    #   isi_violations_pct  : float  — % ISI pairs < 1.5 ms (refractory violations)
+    #   burst_fraction_pct  : float  — % ISI pairs < 5.0 ms (burst criterion)
+    #   trough_to_peak_ms   : float  — waveform trough→peak time in ms
+    #   peak_to_trough_ratio: float  — abs(peak) / abs(trough)
+    #   median_amp_adc      : float  — median absolute trough amplitude (ADC units)
+    biophysics: dict = field(default_factory=dict)
+
+    # ── Convenience properties ───────────────────────────────────────────────
 
     @property
     def n_total(self) -> int:
@@ -91,3 +112,10 @@ class QCResult:
             return 0.0
         missed = max(0, self.n_lh - self.n_sorter_spikes)
         return missed / self.n_lh
+
+    @property
+    def sorter_yield_ratio(self) -> Optional[float]:
+        """n_sorter / n_lh. >1 means sorter found more than LH (possible false positives)."""
+        if self.n_sorter_spikes < 0 or self.n_lh == 0:
+            return None
+        return self.n_sorter_spikes / self.n_lh

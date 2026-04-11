@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np
 import os
-from qtpy.QtWidgets import QMainWindow, QSplitter, QStatusBar, QProgressBar, QPushButton
+from qtpy.QtWidgets import QMainWindow, QSplitter, QProgressBar, QPushButton
 from qtpy.QtCore import Qt, QThread
 from .panels.load_panel import LoadPanel
 from .panels.array_map_panel import ArrayMapPanel
@@ -13,9 +13,9 @@ from .panels.qc_view_panel import QCViewPanel
 from .workers.qc_worker import QCWorker
 from .workers.batch_qc_worker import BatchQCWorker
 from .workers.loader_worker import LoaderWorker
-from core import loader
 from core.lh_qc_pipeline import DEFAULT_PARAMS
 from core.result_types import QCResult
+from .panels.qc_summary_dialog import QCSummaryDialog
 
 
 class MainWindow(QMainWindow):
@@ -26,17 +26,30 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Lighthouse QC")
         self.setGeometry(100, 100, 1600, 900)
 
-        # State
-        self.raw_data = None  # np.memmap [T, C]
-        self.sorter_spike_times: dict = {}   # {ch: times_array}  — flat, for FR plot / miss-rate
-        self.sorter_spike_units: dict = {}   # {ch: {unit_id: times_array}} — nested, for KS plot
-        self.qc_results: dict = {}
+        # ── Recording state ──────────────────────────────────────────────────
+        self.raw_data = None                    # np.memmap or ndarray [T, C]
+        self.qc_results: dict = {}              # {ch: QCResult}
         self.current_channel: Optional[int] = None
         self.lh_params: dict = dict(DEFAULT_PARAMS)
         self.default_dat = default_dat
         self.default_n_channels = default_n_channels
 
-        # Workers / threads
+        # ── KiloSort state ───────────────────────────────────────────────────
+        # sorter_spike_times: {ch: np.ndarray of sample indices}
+        #   — all KS spikes on that electrode channel, pooled across units.
+        #   — used by BatchQCWorker for per-channel miss-rate counting.
+        self.sorter_spike_times: dict = {}
+
+        # sorter_unit_map: {unit_id: np.ndarray of sample indices}
+        #   — one entry per KS cluster, spike times in samples.
+        self.sorter_unit_map: dict = {}
+
+        # sorter_dom_channel: {unit_id: int}
+        #   — dominant electrode channel for each KS cluster, derived from
+        #     templates.npy via argmax of peak-to-peak amplitude across channels.
+        self.sorter_dom_channel: dict = {}
+
+        # ── Workers / threads ────────────────────────────────────────────────
         self._loader_thread: Optional[QThread] = None
         self._loader_worker: Optional[LoaderWorker] = None
         self._single_thread: Optional[QThread] = None
@@ -48,18 +61,17 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
 
-        # Apply CLI defaults
         if self.default_dat or self.default_n_channels:
             self._load_panel.set_defaults(self.default_dat, self.default_n_channels)
 
-    # ── UI setup ─────────────────────────────────────────────────
+    # ── UI setup ─────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         """
         Layout:
         ┌─ LoadPanel (250px) ─┬─ Channel List (250px) ─┬─ QCViewPanel (fill) ─┐
         └─────────────────────┴────────────────────────┴──────────────────────┘
-        Status bar at bottom
+        Status bar at bottom.
         """
         self._load_panel = LoadPanel(self)
         self._channel_list = ArrayMapPanel(self)
@@ -84,25 +96,29 @@ class MainWindow(QMainWindow):
         self._status_bar.addPermanentWidget(self._progress_bar)
         self._status_bar.showMessage("Ready. Load a recording to begin.")
 
+        # Summary button (enabled after batch QC)
+        self._summary_btn = QPushButton("Recording Summary")
+        self._summary_btn.setEnabled(False)
+        self._summary_btn.setToolTip("Show recording-level QC summary across all channels")
+        self._summary_btn.clicked.connect(self._show_summary)
+        self._status_bar.addPermanentWidget(self._summary_btn)
+
     def _connect_signals(self):
         self._load_panel.load_requested.connect(self.on_load_requested)
         self._load_panel.sorter_load_requested.connect(self.on_sorter_load_requested)
         self._channel_list.channel_selected.connect(self.on_channel_selected)
 
-    # ── Data loading ─────────────────────────────────────────────
-
-    # Inside main_window.py, in the MainWindow class
+    # ── Recording loading ─────────────────────────────────────────────────────
 
     def on_load_requested(self, params: dict):
-        """Start background loading – supports both single .dat/.bin file and Litke bin folder."""
-        self.lh_params.update(params) 
-        
+        """Start background loading — supports flat .dat/.bin and Litke bin folder."""
+        self.lh_params.update(params)
+
         dat_path = params.get("dat_path")
         if not dat_path:
             self._status_bar.showMessage("No .dat file or folder specified.")
             return
 
-        # Abort any existing loader
         self._abort_loader()
         self._load_panel.set_loading_state(True)
 
@@ -129,7 +145,6 @@ class MainWindow(QMainWindow):
         self._loader_worker.error.connect(self._on_loader_error)
         self._loader_worker.aborted.connect(self._on_loader_aborted)
 
-        # Cleanup
         self._loader_worker.finished.connect(self._loader_thread.quit)
         self._loader_worker.finished.connect(self._loader_worker.deleteLater)
         self._loader_worker.error.connect(self._loader_thread.quit)
@@ -139,71 +154,136 @@ class MainWindow(QMainWindow):
         self._loader_thread.start()
 
     def _on_loader_finished(self, raw_data):
-        """Loader completed successfully — store data and start batch QC."""
+        """Loader completed — store data and auto-start batch QC."""
         n_ch = raw_data.shape[1]
         self.raw_data = raw_data
-
-        # Build channel list
         self._channel_list.set_array(np.arange(n_ch).reshape(-1, 1))
-
         self._status_bar.showMessage(
             f"Loaded {self.raw_data.shape[0]} samples × {n_ch} channels. Starting batch QC…"
         )
-
         self._load_panel.set_loading_state(False)
-
-        # Auto-start batch QC
         self._start_batch_qc()
 
     def _on_loader_error(self, msg: str):
-        """Loader failed."""
         self._status_bar.showMessage(msg)
         self._qc_view.show_error(msg)
         self._load_panel.set_loading_state(False)
 
     def _on_loader_aborted(self):
-        """Loader was cancelled."""
         self._status_bar.showMessage("Loading cancelled.")
         self._load_panel.set_loading_state(False)
 
     def _abort_loader(self):
-        """Gracefully ask the loader worker to stop."""
         if self._loader_worker:
             self._loader_worker.abort()
         if self._loader_thread and self._loader_thread.isRunning():
             self._loader_thread.quit()
 
+    # ── KiloSort loading ──────────────────────────────────────────────────────
+
     def on_sorter_load_requested(self, path: str):
-        """Load sorter spike times for miss-rate QC."""
+        """
+        Load a KiloSort output folder and build three lookup structures:
+
+          self.sorter_unit_map     {unit_id: spike_times_array}
+          self.sorter_dom_channel  {unit_id: dominant_electrode_channel}
+          self.sorter_spike_times  {electrode_ch: pooled_spike_times_array}
+
+        Required files (all standard KS2/KS4 outputs):
+          spike_times.npy    — [nSpikes] uint64, sample indices
+          spike_clusters.npy — [nSpikes] uint32, cluster ID per spike
+          templates.npy      — [nTemplates, nTimepoints, nChannels] float32
+          channel_map.npy    — [nChannels] int32, maps template ch idx → electrode ch
+
+        Optional:
+          cluster_group.tsv  — if present, noise clusters are excluded automatically.
+        """
         try:
-            self._status_bar.showMessage("Loading sorter output…")
-            n_ch = self.raw_data.shape[1] if self.raw_data is not None else 512
-            self.sorter_spike_times = loader.load_sorter_spike_times(path, n_ch)
-            self.sorter_spike_units = loader.load_sorter_spike_units(path, n_ch)
+            self._status_bar.showMessage("Loading KiloSort output…")
 
-            if self.sorter_spike_times:
-                duration_s = self.raw_data.shape[0] / self.lh_params.get("fs", 20_000)
-                loader.compute_channel_firing_rates(
-                    self.sorter_spike_times, duration_s
-                )
-                self._status_bar.showMessage(
-                    f"Loaded sorter: {len(self.sorter_spike_times)} units."
-                )
-            else:
-                self._status_bar.showMessage("No sorter spike times found.")
+            # ── 1. Load required npy files ───────────────────────────────────
+            spike_times   = np.load(os.path.join(path, "spike_times.npy")).flatten().astype(np.int64)
+            spike_clusters = np.load(os.path.join(path, "spike_clusters.npy")).flatten().astype(np.int32)
+            templates     = np.load(os.path.join(path, "templates.npy"))   # [nTemplates, T, C]
+            channel_map   = np.load(os.path.join(path, "channel_map.npy")).flatten().astype(np.int32)
+
+            # ── 2. Optional: filter out noise clusters ───────────────────────
+            noise_ids: set = set()
+            group_path = os.path.join(path, "cluster_group.tsv")
+            if os.path.exists(group_path):
+                import csv
+                with open(group_path, newline="") as f:
+                    reader = csv.DictReader(f, delimiter="\t")
+                    for row in reader:
+                        if row.get("group", "").strip().lower() == "noise":
+                            noise_ids.add(int(row["cluster_id"]))
+
+            # ── 3. Dominant channel per unit ─────────────────────────────────
+            # templates shape: [nTemplates, nTimepoints, nChannels]
+            # ptp across time axis → [nTemplates, nChannels]
+            # argmax across channel axis → [nTemplates] — index into channel_map
+            template_ptp = templates.ptp(axis=1)           # [nTemplates, nChannels]
+            template_dom_idx = template_ptp.argmax(axis=1)  # [nTemplates] — channel_map index
+            # Map from template index → electrode channel number
+            template_dom_ch = channel_map[template_dom_idx] # [nTemplates]
+
+            # ── 4. Build unit_map and dom_channel ────────────────────────────
+            self.sorter_unit_map = {}
+            self.sorter_dom_channel = {}
+
+            unique_units = np.unique(spike_clusters)
+            for uid in unique_units:
+                if uid in noise_ids:
+                    continue
+                mask = spike_clusters == uid
+                unit_times = spike_times[mask]
+                self.sorter_unit_map[int(uid)] = unit_times
+                # cluster id == template id in KS output (may differ after manual
+                # merges in Phy, but cluster id is still a valid template index
+                # as long as it's in range)
+                if uid < len(template_dom_ch):
+                    self.sorter_dom_channel[int(uid)] = int(template_dom_ch[uid])
+                else:
+                    # Fallback: compute dominant channel directly from spikes
+                    self.sorter_dom_channel[int(uid)] = -1
+
+            # ── 5. Build per-electrode sorter_spike_times ────────────────────
+            # This is the dict BatchQCWorker uses for miss-rate counting:
+            # {electrode_ch: all spike times of all units whose dom ch == electrode_ch}
+            ch_to_times: dict[int, list] = {}
+            for uid, times in self.sorter_unit_map.items():
+                dom_ch = self.sorter_dom_channel.get(uid, -1)
+                if dom_ch < 0:
+                    continue
+                if dom_ch not in ch_to_times:
+                    ch_to_times[dom_ch] = []
+                ch_to_times[dom_ch].append(times)
+
+            self.sorter_spike_times = {
+                ch: np.sort(np.concatenate(time_lists))
+                for ch, time_lists in ch_to_times.items()
+            }
+
+            n_units = len(self.sorter_unit_map)
+            n_ch_covered = len(self.sorter_spike_times)
+            self._status_bar.showMessage(
+                f"KS loaded: {n_units} units across {n_ch_covered} channels"
+                + (f" ({len(noise_ids)} noise excluded)" if noise_ids else "")
+            )
+
+        except FileNotFoundError as e:
+            self._status_bar.showMessage(f"KS load failed — missing file: {e}")
         except Exception as e:
-            self._status_bar.showMessage(f"Sorter load failed: {e}")
+            self._status_bar.showMessage(f"KS load failed: {e}")
 
-    # ── Batch QC lifecycle ───────────────────────────────────────
+    # ── Batch QC lifecycle ────────────────────────────────────────────────────
 
     def _start_batch_qc(self):
         """Start running QC on all channels."""
         if self.raw_data is None:
             return
 
-        # Abort any existing batch first
         self._abort_batch_worker()
-
         self._running_batch = True
         self._channel_list.hide_progress()
 
@@ -221,7 +301,6 @@ class MainWindow(QMainWindow):
         self._batch_worker.error.connect(self._on_batch_error)
         self._batch_worker.aborted.connect(self._on_batch_aborted)
 
-        # Asynchronous cleanup via Qt signals
         self._batch_worker.finished.connect(self._batch_thread.quit)
         self._batch_worker.finished.connect(self._batch_worker.deleteLater)
         self._batch_worker.error.connect(self._batch_thread.quit)
@@ -231,45 +310,54 @@ class MainWindow(QMainWindow):
         self._batch_thread.start()
 
     def _on_batch_progress(self, msg: str, current: int, total: int):
-        """Update progress during batch QC."""
         self._status_bar.showMessage(msg)
         self._channel_list.set_progress(current + 1, total, msg)
 
-    def _attach_sorter_times(self, result: QCResult):
-        """Attach sorter spike times and per-unit map to result for QC plots."""
+    def _attach_sorter_data(self, result: QCResult):
+        """
+        Attach KS data to a QCResult after pipeline completion.
+
+        Populates:
+          result.fs               — sampling rate from lh_params
+          result.sorter_times     — pooled spike times for all KS units on this ch
+                                    (used for FR-over-time overlay in the view panel)
+          result.sorter_unit_map  — {unit_id: times} for units whose dominant
+                                    channel == result.channel
+                                    (used for Venn / raster in the view panel)
+        """
         ch = result.channel
-        times = self.sorter_spike_times.get(ch, None)
-        result.sorter_times = times if times is not None else None
-        result.sorter_unit_map = self.sorter_spike_units.get(ch, {})  # {unit_id: times}
         result.fs = self.lh_params.get("fs", 20_000)
 
+        # Pooled times — already keyed by electrode channel
+        result.sorter_times = self.sorter_spike_times.get(ch, None)
+
+        # Per-unit map — only units whose dominant channel is this electrode
+        result.sorter_unit_map = {
+            uid: times
+            for uid, times in self.sorter_unit_map.items()
+            if self.sorter_dom_channel.get(uid, -1) == ch
+        }
+
     def _on_batch_channel_done(self, result: QCResult):
-        """A single channel QC completed during batch run."""
         ch = result.channel
-        self._attach_sorter_times(result)
+        self._attach_sorter_data(result)
         self.qc_results[ch] = result
         self._channel_list.update_channel_result(ch, result)
-
-        # If this is the currently selected channel, show it
         if self.current_channel == ch:
             self._qc_view.show_result(result)
 
     def _on_batch_finished(self, results: dict):
-        """All channels completed."""
         self._running_batch = False
         self._channel_list.hide_progress()
 
-        # Count LH channels from our own dict
         lh_count = sum(1 for r in self.qc_results.values() if r.n_lh > 0)
         total = results.get("total", len(self.qc_results))
         self._status_bar.showMessage(
             f"Batch QC complete: {lh_count}/{total} channels with LH spikes found."
         )
-
-        # Switch to "LH Found" view by default
+        self._summary_btn.setEnabled(True)
         self._channel_list._view_combo.setCurrentText("LH Found")
 
-        # Show first LH channel
         for ch, result in sorted(self.qc_results.items()):
             if result.n_lh > 0:
                 self.current_channel = ch
@@ -278,25 +366,21 @@ class MainWindow(QMainWindow):
                 break
 
     def _on_batch_error(self, msg: str):
-        """Batch QC failed."""
         self._running_batch = False
         self._channel_list.hide_progress()
         self._status_bar.showMessage(f"Batch QC failed: {msg}")
         self._qc_view.show_error(msg)
 
     def _on_batch_aborted(self):
-        """Batch QC was cancelled."""
         self._running_batch = False
         self._channel_list.hide_progress()
-        completed = len(self.qc_results)
         self._status_bar.showMessage(
-            f"Batch QC cancelled. {completed} channels completed."
+            f"Batch QC cancelled. {len(self.qc_results)} channels completed."
         )
 
-    # ── Single QC run lifecycle ──────────────────────────────────
+    # ── Single QC lifecycle ───────────────────────────────────────────────────
 
     def _abort_batch_worker(self):
-        """Gracefully ask the batch worker to stop."""
         if self._batch_worker:
             self._batch_worker.abort()
         if self._batch_thread and self._batch_thread.isRunning():
@@ -311,25 +395,21 @@ class MainWindow(QMainWindow):
         self.current_channel = ch
         self._channel_list.set_selected_channel(ch)
 
-        # Check cache
         if ch in self.qc_results:
             self._qc_view.show_result(self.qc_results[ch])
             self._status_bar.showMessage(f"CH {ch}: cached result displayed.")
             return
 
-        # If batch is running, show loading placeholder
         if self._running_batch:
             self._qc_view.show_loading(ch)
             self._status_bar.showMessage(f"CH {ch}: queued for batch QC…")
             return
 
-        # Run single channel QC
         self._abort_single_worker()
         self._qc_view.show_loading(ch)
         self._start_single_qc_worker(ch)
 
     def _start_single_qc_worker(self, ch: int):
-        """Spin up QThread + QCWorker for a single channel."""
         n_sorter = self._n_sorter_spikes_for_channel(ch)
 
         self._single_thread = QThread()
@@ -346,7 +426,6 @@ class MainWindow(QMainWindow):
         self._single_worker.error.connect(self.on_single_qc_error)
         self._single_worker.aborted.connect(self.on_single_qc_aborted)
 
-        # Asynchronous cleanup via Qt signals
         self._single_worker.finished.connect(self._single_thread.quit)
         self._single_worker.finished.connect(self._single_worker.deleteLater)
         self._single_worker.error.connect(self._single_thread.quit)
@@ -356,16 +435,14 @@ class MainWindow(QMainWindow):
         self._single_thread.start()
 
     def _abort_single_worker(self):
-        """Gracefully ask the single worker to stop."""
         if self._single_worker is not None:
             self._single_worker.abort()
         if self._single_thread is not None and self._single_thread.isRunning():
             self._single_thread.quit()
 
     def on_single_qc_finished(self, result: QCResult):
-        """Slot for single QCWorker.finished."""
         ch = result.channel
-        self._attach_sorter_times(result)
+        self._attach_sorter_data(result)
         self.qc_results[ch] = result
         self._qc_view.show_result(result)
         self._channel_list.update_channel_result(ch, result)
@@ -376,29 +453,37 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(label)
 
     def on_single_qc_error(self, msg: str):
-        """Show error for single QC run."""
         self._status_bar.showMessage(f"QC failed: {msg}")
         self._qc_view.show_error(msg)
 
     def on_single_qc_aborted(self):
-        """Single QC run was cancelled."""
         self._status_bar.showMessage(f"CH {self.current_channel}: QC cancelled.")
 
-    # ── Utilities ────────────────────────────────────────────────
+    # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _n_sorter_spikes_for_channel(self, ch: int) -> int:
-        """Return count of sorter spikes on channel ch, or -1 if unknown."""
+        """Return count of pooled KS spikes on electrode ch, or -1 if unknown."""
         if not self.sorter_spike_times:
             return -1
         times = self.sorter_spike_times.get(ch, None)
         if times is None:
             return -1
-        if isinstance(times, list):
-            return len(times)
         return int(len(times))
 
+    def _show_summary(self):
+        """Open the recording-level QC summary dialog."""
+        if not self.qc_results:
+            self._status_bar.showMessage("No QC results yet.")
+            return
+        dlg = QCSummaryDialog(
+            qc_results=self.qc_results,
+            sorter_unit_map=self.sorter_unit_map,
+            fs=self.lh_params.get("fs", 20_000),
+            parent=self,
+        )
+        dlg.exec_()
+
     def closeEvent(self, event):
-        """Abort workers and request async cleanup, then accept close."""
         self._abort_loader()
         if self._batch_worker:
             self._batch_worker.abort()

@@ -45,6 +45,41 @@ For **Kilosort-format single files**, the app automatically subtracts baselines 
 - Add unit tests for core pipeline functions
 - Implement actual spatial electrode map (currently just a channel list)
 
+### ⏳ Upcoming Phases (Next Priority)
+
+#### Phase 1: Data Model Expansion (`core/result_types.py`)
+**Objective:** Expand `QCResult` to hold advanced clustering metrics and retinal ganglion cell (RGC) biophysics.
+- Add two new `dict` fields to `QCResult`: `km_info` (K-Means precheck & verdict details) and `biophysics` (temporal & waveform metrics).
+- **Why:** These dictionaries serve as the payload for CSV export. Using `dict` instead of hardcoded attributes lets us add more metrics later without breaking the dataclass signature.
+
+#### Phase 2: Biophysics Extraction (`core/lh_qc_pipeline.py`)
+**Objective:** Calculate physiological ground-truth metrics for each detected Lighthouse unit *before* returning the final `QCResult`.
+- Create a new helper function (e.g., `compute_biophysics(raw_data, detect_ch, left_times, fs, window)`).
+- **Calculate Temporal Metrics:** firing rate (Hz), ISI violations (% of spikes < 1.5 ms), burst fraction (% of spikes < 5.0 ms).
+- **Calculate Waveform Metrics:** Extract a subset of spikes (~500) to find the mean waveform. Compute trough-to-peak time (ms), peak-to-trough ratio, and absolute median amplitude.
+- Hook this function into the bottom of `run_qc_pipeline` and pass the resulting dict into `QCResult`.
+
+#### Phase 3: Safe Parallelization (`workers/batch_qc_worker.py`)
+**Objective:** Process ~8 channels simultaneously without crashing the C++ backend or dropping UI updates.
+- Rewrite `BatchQCWorker` to act as a manager for a `QThreadPool` rather than processing a standard `for` loop.
+- **⚠️ CRITICAL TECHNICAL TRAPS:**
+  1. **OpenMP Deadlocks:** The pipeline uses Scikit-Learn (PCA/KMeans). If 8 threads run KMeans simultaneously, the underlying C-libraries will spawn 64+ threads and lock up the machine. The dev **must** set OpenMP environment variables (e.g., `OMP_NUM_THREADS="1"`, `MKL_NUM_THREADS="1"`, `OPENBLAS_NUM_THREADS="1"`, `NUMEXPR_NUM_THREADS="1"`) at the top of the file.
+  2. **Garbage Collection Crash:** When queuing hundreds of `QRunnable` tasks into a Qt thread pool in Python, the Python Garbage Collector will delete the pending tasks before they run, causing silent crashes. The dev **must** keep a persistent Python list (e.g., `self._tasks.append(task)`) to keep the references alive until the batch finishes.
+  3. **Out-of-Order Signals:** The UI progress bar must be updated based on a `_completed_count` integer, *not* the channel number, since threads will finish out of numerical order.
+
+#### Phase 4: UI, Export, and Persistence (`main_window.py`)
+**Objective:** Allow the user to save the session state to disk to avoid re-running, and export the biophysics payload to CSV for Jupyter/Colab analysis.
+- **Session Load/Save:** Add two buttons connected to Python's `pickle` library. Save the entire `self.qc_results` dictionary to a `.pkl` file. On load, populate the dictionary and update the `_channel_list` UI.
+- **CSV Export:** Add an "Export CSV" button. Iterate through `self.qc_results` and write a wide-format CSV.
+- **Required CSV Columns:**
+  | Group | Columns |
+  |---|---|
+  | *Yield & Sorter comparison* | `channel`, `status`, `n_lh`, `n_sorter`, `miss_rate`, `sorter_yield_ratio` (n_sorter / n_lh) |
+  | *QC Internals* | `valley_low`, `valley_high`, `pca_var_1`, `km_verdict`, `cluster_cos_sim` |
+  | *Biophysics* | `median_lh_amp`, `firing_rate_hz`, `burst_fraction_pct`, `isi_violations_pct`, `trough_to_peak_ms` |
+- **Dev Note:** Handle missing data gracefully. If a channel was rejected early in the pipeline, its biophysics dictionary will be empty. The CSV writer needs `dict.get('key', '')` fallbacks to avoid crashing.
+- **Downstream Use Note:** The CSV is designed for a Pandas DataFrame that can be grouped by Species (Marmoset vs. Mouse) and Stimulus (White Noise vs. Flashes). The `burst_fraction_pct` and `miss_rate` columns are the most critical deliverables for proving that the sorter drops synchronous spikes during high-contrast visual stimuli.
+
 ### Implementation Order (Updated)
 1. ✅ `core/result_types.py` — dataclasses, no deps
 2. ✅ `core/loader.py` — raw data loading + Litke support
@@ -58,8 +93,12 @@ For **Kilosort-format single files**, the app automatically subtracts baselines 
 10. ✅ `gui/workers/batch_qc_worker.py` — batch QC with progress tracking
 11. ✅ `gui/workers/loader_worker.py` — background loading + baseline subtraction
 12. ✅ `gui/panels/qc_view_panel.py` — 4 pyqtgraph plots + summary bar
-13. ⏳ Integration testing on real datasets
-14. ⏳ Unit tests for core functions
+13. ⏳ **Phase 1:** Expand `QCResult` with `km_info` and `biophysics` dicts
+14. ⏳ **Phase 2:** Implement `compute_biophysics()` in `lh_qc_pipeline.py`
+15. ⏳ **Phase 3:** Rewrite `BatchQCWorker` for safe `QThreadPool` parallelization
+16. ⏳ **Phase 4:** Add session save/load (`.pkl`) and CSV export to `main_window.py`
+17. ⏳ Integration testing on real datasets
+18. ⏳ Unit tests for core functions
 
 ---
 

@@ -153,7 +153,7 @@ class LoaderWorker(QObject):
 
             # ── Step 2: Compute baselines ──────────────────────────────
             self.progress.emit("Computing baselines…")
-            baselines = compute_baselines_int16_deriv_robust(raw_data)
+            baselines = compute_baselines_int16_deriv_robust(raw_data, stride=10)
 
             if self._abort:
                 self.aborted.emit()

@@ -50,17 +50,24 @@ class QCViewPanel(QWidget):
 
         self._plot_hist = pg.PlotWidget()
         self._plot_pca = pg.PlotWidget()
-        self._plot_fr = pg.PlotWidget()
         self._plot_waveforms = pg.PlotWidget()
 
         self._plot_hist.showGrid(x=True, y=True, alpha=0.15)
         self._plot_pca.showGrid(x=True, y=True, alpha=0.15)
-        self._plot_fr.showGrid(x=True, y=True, alpha=0.15)
         self._plot_waveforms.showGrid(x=True, y=True, alpha=0.15)
+
+        # Bottom-left: stacked KS fragmentation bar + FR overlay
+        self._fr_layout = pg.GraphicsLayoutWidget()
+        self._plot_fr   = self._fr_layout.addPlot(row=0, col=0)   # KS fragmentation
+        self._plot_fr_time = self._fr_layout.addPlot(row=1, col=0) # FR over time
+        self._fr_layout.ci.layout.setRowStretchFactor(0, 3)
+        self._fr_layout.ci.layout.setRowStretchFactor(1, 2)
+        self._plot_fr.showGrid(x=True, y=True, alpha=0.15)
+        self._plot_fr_time.showGrid(x=True, y=True, alpha=0.15)
 
         grid.addWidget(self._plot_hist, 0, 0)
         grid.addWidget(self._plot_pca, 0, 1)
-        grid.addWidget(self._plot_fr, 1, 0)
+        grid.addWidget(self._fr_layout, 1, 0)
         grid.addWidget(self._plot_waveforms, 1, 1)
 
         # Set stretch — give equal weight
@@ -94,8 +101,9 @@ class QCViewPanel(QWidget):
             self._update_amp_histogram(result)
             self._update_pca_scatter(result)
             self._update_fr_plot(result)
+            self._update_fr_time_plot(result)
             self._update_waveforms(result)
-            self._update_summary_bar(result) 
+            self._update_summary_bar(result)
             return
             
         # Standard display for valid channels
@@ -104,6 +112,7 @@ class QCViewPanel(QWidget):
         self._update_amp_histogram(result)
         self._update_pca_scatter(result)
         self._update_fr_plot(result)
+        self._update_fr_time_plot(result)
         self._update_waveforms(result)
 
     def show_loading(self, channel: int):
@@ -136,7 +145,8 @@ class QCViewPanel(QWidget):
     def _clear_plots(self):
         for p in [
             self._plot_hist, self._plot_pca,
-            self._plot_fr, self._plot_waveforms,
+            self._plot_fr, self._plot_fr_time,
+            self._plot_waveforms,
         ]:
             p.clear()
 
@@ -232,128 +242,117 @@ class QCViewPanel(QWidget):
         )
 
     def _update_fr_plot(self, result):
-        """KS fragmentation plot: for each LH spike, which KS unit claimed it?
-
-        Algorithm
-        ---------
-        1. Gather all LH spike times for this channel (left + rightk valley times).
-        2. Pool all KS spikes across units into a single sorted array, keeping a
-           parallel unit-ID array.
-        3. For each LH spike, binary-search for the nearest KS spike; if it falls
-           within the coincidence window (default ±1 ms) record its unit ID.
-        4. Plot a bar chart: x = KS unit ID (sorted by spike count desc), y = matched
-           spike count.  Append a "Missed" bar in red for unmatched LH spikes.
-        """
-        p = self._plot_fr
+        """KS fragmentation bar chart (top half of bottom-left slot)."""
+        p = self._plot_fr   # PlotItem inside GraphicsLayoutWidget
         p.clear()
 
-        fs = getattr(result, 'fs', 20_000)
-        coincidence_samp = int(0.001 * fs)  # ±1 ms in samples
+        fs = getattr(result, "fs", 20_000)
+        coincidence_samp = int(0.001 * fs)  # ±1 ms
 
-        # ── collect LH spike times ────────────────────────────────────────────
         lh_times = np.array([], dtype=np.int64)
-        if hasattr(result, 'valley'):
-            parts = []
-            if result.valley.left_times.size:
-                parts.append(result.valley.left_times)
-            if result.valley.rightk_times.size:
-                parts.append(result.valley.rightk_times)
+        if hasattr(result, "valley"):
+            parts = [t for t in [result.valley.left_times, result.valley.rightk_times] if t.size]
             if parts:
                 lh_times = np.sort(np.concatenate(parts))
 
-        sorter_unit_map: dict = getattr(result, 'sorter_unit_map', {})
+        sorter_unit_map = getattr(result, "sorter_unit_map", {})
 
-        # ── no sorter data: show informative placeholder ──────────────────────
         if not sorter_unit_map:
-            p.setTitle(f"KS Fragmentation — CH {result.channel} (no sorter loaded)")
-            p.setLabel("bottom", "KS unit / status")
-            p.setLabel("left", "LH spikes matched")
+            p.setTitle(f"KS Fragmentation — CH {result.channel} (no sorter)")
             return
-
         if lh_times.size == 0:
             p.setTitle(f"KS Fragmentation — CH {result.channel} (no LH spikes)")
             return
 
-        # ── pool KS spikes with unit labels ──────────────────────────────────
-        all_ks_times_list, all_ks_units_list = [], []
-        for uid, t in sorter_unit_map.items():
-            all_ks_times_list.append(t)
-            all_ks_units_list.append(np.full(len(t), uid, dtype=np.int64))
+        # Pool all KS spikes with unit labels
+        all_t = np.concatenate(list(sorter_unit_map.values()))
+        all_u = np.concatenate([
+            np.full(len(t), uid, dtype=np.int64)
+            for uid, t in sorter_unit_map.items()
+        ])
+        order = np.argsort(all_t)
+        ks_times = all_t[order];  ks_units = all_u[order]
 
-        ks_times = np.concatenate(all_ks_times_list)  # pooled, unsorted
-        ks_units = np.concatenate(all_ks_units_list)
-
-        order = np.argsort(ks_times)
-        ks_times = ks_times[order]
-        ks_units = ks_units[order]
-
-        # ── match each LH spike to nearest KS spike within window ────────────
+        # Match each LH spike to nearest KS spike within window
         match_counts: dict[int, int] = {}
         n_missed = 0
-
-        insert_idx = np.searchsorted(ks_times, lh_times)  # vectorised anchor
-
-        for i, (lh_t, idx) in enumerate(zip(lh_times, insert_idx)):
-            best_uid = None
-            best_dist = coincidence_samp + 1  # start outside window
-
-            # check left neighbour
+        ins = np.searchsorted(ks_times, lh_times)
+        for lh_t, idx in zip(lh_times, ins):
+            best_uid, best_d = None, coincidence_samp + 1
             if idx > 0:
-                d = abs(int(lh_t) - int(ks_times[idx - 1]))
-                if d < best_dist:
-                    best_dist = d
-                    best_uid = int(ks_units[idx - 1])
-
-            # check right neighbour
+                d = abs(int(lh_t) - int(ks_times[idx-1]))
+                if d < best_d: best_d, best_uid = d, int(ks_units[idx-1])
             if idx < len(ks_times):
                 d = abs(int(lh_t) - int(ks_times[idx]))
-                if d < best_dist:
-                    best_dist = d
-                    best_uid = int(ks_units[idx])
-
-            if best_uid is not None and best_dist <= coincidence_samp:
+                if d < best_d: best_d, best_uid = d, int(ks_units[idx])
+            if best_uid is not None and best_d <= coincidence_samp:
                 match_counts[best_uid] = match_counts.get(best_uid, 0) + 1
             else:
                 n_missed += 1
 
-        # ── build bar chart data ──────────────────────────────────────────────
-        # Sort matched units by count descending so the dominant unit is leftmost
         sorted_units = sorted(match_counts.items(), key=lambda kv: -kv[1])
-
-        bar_labels: list[str] = [f"u{uid}" for uid, _ in sorted_units]
-        bar_counts: list[int] = [cnt for _, cnt in sorted_units]
-
+        bar_labels = [f"u{uid}" for uid, _ in sorted_units]
+        bar_counts = [cnt for _, cnt in sorted_units]
         if n_missed > 0:
-            bar_labels.append("Missed")
-            bar_counts.append(n_missed)
+            bar_labels.append("Missed"); bar_counts.append(n_missed)
 
-        n_bars = len(bar_labels)
-        x = np.arange(n_bars, dtype=np.float64)
-
-        # Draw bars one by one so we can color "Missed" red
+        x = np.arange(len(bar_labels), dtype=np.float64)
         for i, (label, count) in enumerate(zip(bar_labels, bar_counts)):
             color = "#F44336" if label == "Missed" else "#4CAF50"
-            bar = pg.BarGraphItem(
+            p.addItem(pg.BarGraphItem(
                 x=[x[i]], height=[count], width=0.7,
-                brush=pg.mkBrush(color),
-                pen=pg.mkPen("#1a1a1a", width=0.5),
-            )
-            p.addItem(bar)
+                brush=pg.mkBrush(color), pen=pg.mkPen("#1a1a1a", width=0.5),
+            ))
 
-        # ── x-axis tick labels ────────────────────────────────────────────────
         ax = p.getAxis("bottom")
         ax.setTicks([[(xi, lbl) for xi, lbl in zip(x, bar_labels)]])
-
-        # ── title and axis labels ─────────────────────────────────────────────
         win_ms = coincidence_samp * 1000 / fs
-        n_units_matched = len(match_counts)
         p.setTitle(
             f"KS Fragmentation — CH {result.channel}  "
-            f"({n_units_matched} unit{'s' if n_units_matched != 1 else ''} matched, "
-            f"±{win_ms:.0f} ms window)"
+            f"({len(match_counts)} unit{'s' if len(match_counts)!=1 else ''} matched, ±{win_ms:.0f} ms)"
         )
         p.setLabel("bottom", "KS unit ID")
         p.setLabel("left", "LH spikes matched")
+
+    def _update_fr_time_plot(self, result):
+        """FR over time: LH (green) vs KS sorter (blue) — bottom sub-panel."""
+        p = self._plot_fr_time  # PlotItem
+        p.clear()
+        p.addLegend(offset=(10, 10), labelTextSize="8pt")
+
+        fs = getattr(result, "fs", 20_000)
+        bin_s = 1.0
+        lh_times = np.array([], dtype=np.int64)
+        if hasattr(result, "valley"):
+            parts = [t for t in [result.valley.left_times, result.valley.rightk_times] if t.size]
+            if parts:
+                lh_times = np.sort(np.concatenate(parts))
+
+        sorter_times = getattr(result, "sorter_times", None)
+
+        all_times = lh_times.copy()
+        if sorter_times is not None and sorter_times.size:
+            all_times = np.concatenate([all_times, sorter_times])
+        if all_times.size == 0:
+            p.setTitle("FR over time (no spikes)")
+            return
+
+        n_bins = max(1, int(all_times.max() / fs / bin_s) + 1)
+        bins = np.arange(n_bins + 1, dtype=np.float64) * bin_s
+
+        if lh_times.size:
+            lh_counts, _ = np.histogram(lh_times / fs, bins=bins)
+            p.plot(bins[:-1], lh_counts.astype(np.float64),
+                   pen=pg.mkPen("#4CAF50", width=1.2), name="LH")
+        if sorter_times is not None and sorter_times.size:
+            s_counts, _ = np.histogram(sorter_times / fs, bins=bins)
+            p.plot(bins[:-1], s_counts.astype(np.float64),
+                   pen=pg.mkPen("#2196F3", width=1.2), name="KS")
+
+        has_ks = sorter_times is not None and sorter_times.size > 0
+        p.setTitle(f"FR over time — CH {result.channel}" + ("" if has_ks else " (no KS)"))
+        p.setLabel("bottom", "Time (s)")
+        p.setLabel("left", "Spikes/s")
 
     def _update_waveforms(self, result: QCResult):
         p = self._plot_waveforms

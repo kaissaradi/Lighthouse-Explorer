@@ -960,7 +960,9 @@ def run_bltr_support(
 ) -> BLTRResult:
     """
     Step 3: Full BL/TR support labeling using notebook's algorithm.
-    Returns BLTRResult with counts (and empty arrays for per-spike data to save memory).
+    Labels ALL left_times (BL group) and ALL rightk_times (TR group) —
+    not just probe subsets — so counts reflect the full spike population.
+    Returns BLTRResult with accurate per-spike counts.
     """
     left_times = valley.left_times
     rightk_times = getattr(valley, "rightk_times", np.array([], dtype=np.int64))
@@ -974,7 +976,7 @@ def run_bltr_support(
             times=np.array([], dtype=np.int64),
         )
 
-    # Adaptive window
+    # Adaptive window — determines the snippet window for ALL spikes
     km_win, _ = choose_adaptive_km_window(
         raw_data, left_times,
         probe_n=params.get("km_probe_n", 500),
@@ -989,64 +991,48 @@ def run_bltr_support(
         rng=np.random.RandomState(params.get("random_state", 42)),
     )
 
-    # Extract amplitudes on main channel to pick weakest/strongest
-    main_ch = detect_ch
-    sn_main_left, _ = extract_snippets_fast_ram(
-        raw_data, left_times, window=km_win,
-        selected_channels=np.array([main_ch], dtype=np.int32)
-    )
-    if sn_main_left.shape[2] == 0:
-        return BLTRResult(
-            labels=np.array([], dtype=object),
-            bl_bulk=np.array([], dtype=np.float32),
-            tr_bulk=np.array([], dtype=np.float32),
-            counts={"LH": 0, "soup": 0, "uncertain_boundary": 0, "uncertain_lowBL": 0},
-            times=np.array([], dtype=np.int64),
-        )
-    amp_left = np.ptp(sn_main_left[0, :, :], axis=0)
-    order_weak = np.argsort(amp_left)
-    n_probe = int(params.get("support_n_probe_per_side", 2000))
-    n_probe = min(n_probe, left_times.size)
-    bl_times = left_times[order_weak[:n_probe]]
-
-    # Right side
-    sn_main_right, _ = extract_snippets_fast_ram(
-        raw_data, rightk_times, window=km_win,
-        selected_channels=np.array([main_ch], dtype=np.int32)
-    )
-    if sn_main_right.shape[2] == 0:
-        return BLTRResult(
-            labels=np.array([], dtype=object),
-            bl_bulk=np.array([], dtype=np.float32),
-            tr_bulk=np.array([], dtype=np.float32),
-            counts={"LH": 0, "soup": 0, "uncertain_boundary": 0, "uncertain_lowBL": 0},
-            times=np.array([], dtype=np.int64),
-        )
-    amp_right = np.ptp(sn_main_right[0, :, :], axis=0)
-    order_strong = np.argsort(amp_right)[::-1]
-    n_probe = min(n_probe, rightk_times.size)
-    tr_times = rightk_times[order_strong[:n_probe]]
-
-    # Top channels for support
+    # ── Determine top channels for support labeling ─────────────────────
     n_top = int(params.get("support_top_channels", 12))
-    # Use a small sample to determine top channels
     sample_times = left_times[:min(100, len(left_times))]
     sn_sample, _ = extract_snippets_fast_ram(
         raw_data, sample_times, window=km_win,
         selected_channels=np.arange(raw_data.shape[1], dtype=np.int32)
     )
-    rms = np.sqrt(np.mean(sn_sample**2, axis=(1,2)))
+    rms = np.sqrt(np.mean(sn_sample**2, axis=(1, 2)))
     top_ch = np.argsort(rms)[-n_top:][::-1].astype(np.int32)
     if top_ch.size == 0:
         top_ch = np.arange(raw_data.shape[1], dtype=np.int32)[:n_top]
 
-    # Extract snippets for BL and TR groups
+    # ── Extract snippets for ALL BL (left) and ALL TR (rightk) spikes ───
+    # The BL/TR decision algorithm is O(N² * D): each spike does a full
+    # cosine-similarity pass over every other spike.  To prevent the QC
+    # from hanging on high-firing-rate channels, cap each side at a
+    # representative random subsample and scale the counts back.
+    MAX_BLTR = 3_000
+    subsample_bl = left_times.size > MAX_BLTR
+    subsample_tr = rightk_times.size > MAX_BLTR
+
+    if subsample_bl:
+        rng = np.random.RandomState(params.get("random_state", 42))
+        idx_bl = rng.choice(left_times.size, MAX_BLTR, replace=False)
+        bl_times = left_times[np.sort(idx_bl)]
+    else:
+        bl_times = left_times
+
+    if subsample_tr:
+        rng = np.random.RandomState(params.get("random_state", 42) + 1)
+        idx_tr = rng.choice(rightk_times.size, MAX_BLTR, replace=False)
+        tr_times = rightk_times[np.sort(idx_tr)]
+    else:
+        tr_times = rightk_times
+
     sn_bl, bl_valid = extract_snippets_fast_ram(
         raw_data, bl_times, window=km_win, selected_channels=top_ch
     )
     sn_tr, tr_valid = extract_snippets_fast_ram(
         raw_data, tr_times, window=km_win, selected_channels=top_ch
     )
+
     if sn_bl.shape[2] < 2 or sn_tr.shape[2] < 2:
         return BLTRResult(
             labels=np.array([], dtype=object),
@@ -1056,30 +1042,48 @@ def run_bltr_support(
             times=np.array([], dtype=np.int64),
         )
 
+    # ── Run BL/TR decision on the (possibly subsampled) groups ──────────
     decision = compute_bl_tr_support_decisions_from_groups(
         sn_bl,
         sn_tr,
         cos_mask_adc=params.get("support_cos_mask_adc", 30.0),
-        k_peak=params.get("support_k_peak", (5,10,20)),
-        k_bulk=params.get("support_k_bulk", (50,100,200)),
+        k_peak=params.get("support_k_peak", (5, 10, 20)),
+        k_bulk=params.get("support_k_bulk", (50, 100, 200)),
         min_bl_bulk=params.get("support_min_bl_bulk", 0.70),
         diag_eps=params.get("support_diag_eps", 0.05),
     )
 
-    # Combine counts from BL and TR
     blc = decision["bl_counts"]
     trc = decision["tr_counts"]
-    total_lh = blc["LH"] + trc["LH"]
-    total_soup = blc["soup"] + trc["soup"]
-    total_uncertain = (blc["uncertain_boundary"] + blc["uncertain_lowBL"] +
-                       trc["uncertain_boundary"] + trc["uncertain_lowBL"])
+
+    # ── Scale counts back to full population if we subsampled ───────────
+    # Each labeled spike in the subsample represents a fraction of the
+    # full population.  We round to nearest integer.
+    if subsample_bl:
+        scale_bl = left_times.size / MAX_BLTR
+    else:
+        scale_bl = 1.0
+
+    if subsample_tr:
+        scale_tr = rightk_times.size / MAX_BLTR
+    else:
+        scale_tr = 1.0
+
+    total_lh = int(round(blc["LH"] * scale_bl + trc["LH"] * scale_tr))
+    total_soup = int(round(blc["soup"] * scale_bl + trc["soup"] * scale_tr))
+    total_unc_bnd = int(round(blc["uncertain_boundary"] * scale_bl + trc["uncertain_boundary"] * scale_tr))
+    total_unc_low = int(round(blc["uncertain_lowBL"] * scale_bl + trc["uncertain_lowBL"] * scale_tr))
 
     return BLTRResult(
-        labels=np.array([], dtype=object),  # not storing per-spike labels to save memory
+        labels=np.array([], dtype=object),
         bl_bulk=np.array([], dtype=np.float32),
         tr_bulk=np.array([], dtype=np.float32),
-        counts={"LH": total_lh, "soup": total_soup,
-                "uncertain_boundary": 0, "uncertain_lowBL": total_uncertain},
+        counts={
+            "LH": total_lh,
+            "soup": total_soup,
+            "uncertain_boundary": total_unc_bnd,
+            "uncertain_lowBL": total_unc_low,
+        },
         times=np.array([], dtype=np.int64),
     )
 
