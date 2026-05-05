@@ -80,7 +80,7 @@ class BatchQCWorker(QObject):
         self._tasks = []  # <--- CRITICAL: Prevents Python Garbage Collector from killing tasks
         
         self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(8)  
+        self._pool.setMaxThreadCount(1)  
 
     def abort(self):
         """Signal the worker to stop and clear pending tasks."""

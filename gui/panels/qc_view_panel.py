@@ -242,77 +242,89 @@ class QCViewPanel(QWidget):
         )
 
     def _update_fr_plot(self, result):
-        """KS fragmentation bar chart (top half of bottom-left slot)."""
-        p = self._plot_fr   # PlotItem inside GraphicsLayoutWidget
+        """Venn Diagram replacing KS fragmentation bar chart."""
+        p = self._plot_fr
         p.clear()
 
         fs = getattr(result, "fs", 20_000)
-        coincidence_samp = int(0.001 * fs)  # ±1 ms
+        coincidence_samp = int(0.001 * fs)  # ±1 ms window
 
+        # 1. Gather all LH spikes
         lh_times = np.array([], dtype=np.int64)
         if hasattr(result, "valley"):
             parts = [t for t in [result.valley.left_times, result.valley.rightk_times] if t.size]
             if parts:
                 lh_times = np.sort(np.concatenate(parts))
 
+        # 2. Gather all KS spikes for this channel
         sorter_unit_map = getattr(result, "sorter_unit_map", {})
+        if sorter_unit_map:
+            all_t = np.concatenate(list(sorter_unit_map.values()))
+            ks_times = np.sort(all_t)
+        else:
+            ks_times = np.array([], dtype=np.int64)
 
         if not sorter_unit_map:
-            p.setTitle(f"KS Fragmentation — CH {result.channel} (no sorter)")
+            p.setTitle(f"LH vs KS Venn Diagram — CH {result.channel} (no sorter)")
             return
         if lh_times.size == 0:
-            p.setTitle(f"KS Fragmentation — CH {result.channel} (no LH spikes)")
+            p.setTitle(f"LH vs KS Venn Diagram — CH {result.channel} (no LH spikes)")
             return
 
-        # Pool all KS spikes with unit labels
-        all_t = np.concatenate(list(sorter_unit_map.values()))
-        all_u = np.concatenate([
-            np.full(len(t), uid, dtype=np.int64)
-            for uid, t in sorter_unit_map.items()
-        ])
-        order = np.argsort(all_t)
-        ks_times = all_t[order];  ks_units = all_u[order]
-
-        # Match each LH spike to nearest KS spike within window
-        match_counts: dict[int, int] = {}
-        n_missed = 0
-        ins = np.searchsorted(ks_times, lh_times)
-        for lh_t, idx in zip(lh_times, ins):
-            best_uid, best_d = None, coincidence_samp + 1
-            if idx > 0:
-                d = abs(int(lh_t) - int(ks_times[idx-1]))
-                if d < best_d: best_d, best_uid = d, int(ks_units[idx-1])
-            if idx < len(ks_times):
-                d = abs(int(lh_t) - int(ks_times[idx]))
-                if d < best_d: best_d, best_uid = d, int(ks_units[idx])
-            if best_uid is not None and best_d <= coincidence_samp:
-                match_counts[best_uid] = match_counts.get(best_uid, 0) + 1
+        # 3. Fast two-pointer matching
+        matched = 0
+        i, j = 0, 0
+        while i < len(lh_times) and j < len(ks_times):
+            diff = lh_times[i] - ks_times[j]
+            if abs(diff) <= coincidence_samp:
+                matched += 1
+                i += 1
+                j += 1
+            elif diff < 0:
+                i += 1  # LH spike earlier
             else:
-                n_missed += 1
+                j += 1  # KS spike earlier
 
-        sorted_units = sorted(match_counts.items(), key=lambda kv: -kv[1])
-        bar_labels = [f"u{uid}" for uid, _ in sorted_units]
-        bar_counts = [cnt for _, cnt in sorted_units]
-        if n_missed > 0:
-            bar_labels.append("Missed"); bar_counts.append(n_missed)
+        lh_only = len(lh_times) - matched
+        ks_only = len(ks_times) - matched
 
-        x = np.arange(len(bar_labels), dtype=np.float64)
-        for i, (label, count) in enumerate(zip(bar_labels, bar_counts)):
-            color = "#F44336" if label == "Missed" else "#4CAF50"
-            p.addItem(pg.BarGraphItem(
-                x=[x[i]], height=[count], width=0.7,
-                brush=pg.mkBrush(color), pen=pg.mkPen("#1a1a1a", width=0.5),
-            ))
+        # 4. Draw the Venn Diagram 
+        theta = np.linspace(0, 2 * np.pi, 100)
+        r = 1.0
+        
+        # Circle boundaries
+        x_lh = -0.5 + r * np.cos(theta)
+        y_lh = r * np.sin(theta)
+        
+        x_ks = 0.5 + r * np.cos(theta)
+        y_ks = r * np.sin(theta)
+        
+        # Add outlines
+        p.addItem(pg.PlotCurveItem(x_lh, y_lh, pen=pg.mkPen("#4CAF50", width=2))) # Green LH
+        p.addItem(pg.PlotCurveItem(x_ks, y_ks, pen=pg.mkPen("#2196F3", width=2))) # Blue KS
+        
+        # Add Text Labels
+        text_lh = pg.TextItem(f"LH Only\n{lh_only}", color="#4CAF50", anchor=(0.5, 0.5))
+        text_lh.setPos(-0.9, 0)
+        p.addItem(text_lh)
+        
+        text_both = pg.TextItem(f"Matched\n{matched}", color="#FFFFFF", anchor=(0.5, 0.5))
+        text_both.setPos(0, 0)
+        p.addItem(text_both)
+        
+        text_ks = pg.TextItem(f"KS Only\n{ks_only}", color="#2196F3", anchor=(0.5, 0.5))
+        text_ks.setPos(0.9, 0)
+        p.addItem(text_ks)
 
-        ax = p.getAxis("bottom")
-        ax.setTicks([[(xi, lbl) for xi, lbl in zip(x, bar_labels)]])
+        # 5. Clean up plot aesthetics
+        p.hideAxis('bottom')
+        p.hideAxis('left')
+        p.setAspectLocked(True) # Keep circles round
+        p.setXRange(-2, 2, padding=0)
+        p.setYRange(-1.5, 1.5, padding=0)
+        
         win_ms = coincidence_samp * 1000 / fs
-        p.setTitle(
-            f"KS Fragmentation — CH {result.channel}  "
-            f"({len(match_counts)} unit{'s' if len(match_counts)!=1 else ''} matched, ±{win_ms:.0f} ms)"
-        )
-        p.setLabel("bottom", "KS unit ID")
-        p.setLabel("left", "LH spikes matched")
+        p.setTitle(f"LH vs KS Venn Diagram — CH {result.channel} (±{win_ms:.0f} ms)")
 
     def _update_fr_time_plot(self, result):
         """FR over time: LH (green) vs KS sorter (blue) — bottom sub-panel."""

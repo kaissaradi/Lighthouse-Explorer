@@ -222,7 +222,7 @@ class MainWindow(QMainWindow):
             # templates shape: [nTemplates, nTimepoints, nChannels]
             # ptp across time axis → [nTemplates, nChannels]
             # argmax across channel axis → [nTemplates] — index into channel_map
-            template_ptp = templates.ptp(axis=1)           # [nTemplates, nChannels]
+            template_ptp = templates.max(axis=1) - templates.min(axis=1)        # [nTemplates, nChannels]
             template_dom_idx = template_ptp.argmax(axis=1)  # [nTemplates] — channel_map index
             # Map from template index → electrode channel number
             template_dom_ch = channel_map[template_dom_idx] # [nTemplates]

@@ -701,8 +701,8 @@ DEFAULT_PARAMS = dict(
     # PCA / KMeans (on left spikes only)
     n_pcs=3,
     n_clusters=2,
-    n_left_spikes_for_pca=999999,    # use all spikes (no subsampling)
-    n_top_channels_for_pca=16,       # fixed top 16 (as you prefer)
+    n_left_spikes_for_pca=5000,    # use all spikes (no subsampling)
+    n_top_channels_for_pca=7,       # fixed top 16 (as you prefer)
     random_state=42,
 
     # K-means verdict thresholds
@@ -805,7 +805,7 @@ def run_pca_kmeans_on_left_spikes(
     km_win, _ = choose_adaptive_km_window(
         raw_data, left_times,
         probe_n=params.get("km_probe_n", 500),
-        probe_win=params.get("km_probe_win", (-40, 80)),
+        probe_win=params.get("km_probe_win", (-30, 50)),
         fallback_win=params.get("window", (-20, 40)),
         time_amp_thr=params.get("km_probe_time_amp_thr", 30.0),
         ch_ptp_thr=params.get("km_probe_ch_ptp_thr", 30.0),
