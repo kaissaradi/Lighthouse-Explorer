@@ -17,6 +17,7 @@ from qtpy.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSizePolicy
 )
 from qtpy.QtCore import Qt
+from gui.theme import COLORS
 
 
 def _fragmentation_index(sorter_unit_map: dict, lh_times: np.ndarray, fs: float) -> dict:
@@ -28,33 +29,21 @@ def _fragmentation_index(sorter_unit_map: dict, lh_times: np.ndarray, fs: float)
     if not sorter_unit_map or lh_times.size == 0:
         return None
 
-    coincidence_samp = int(0.001 * fs)
-    all_t = np.concatenate(list(sorter_unit_map.values()))
-    all_u = np.concatenate([
-        np.full(len(t), uid, dtype=np.int64)
-        for uid, t in sorter_unit_map.items()
-    ])
-    order = np.argsort(all_t)
-    ks_times = all_t[order]
-    ks_units = all_u[order]
+    from core.spike_match import match_spikes
 
+    coincidence_samp = int(0.001 * fs)
+
+    # Overall match to get miss count
+    all_ks_times = np.sort(np.concatenate(list(sorter_unit_map.values())))
+    n_matched_total, n_missed, _, _ = match_spikes(lh_times, all_ks_times, coincidence_samp)
+
+    # Per-unit match to determine which units actually participate
     match_counts: dict[int, int] = {}
-    n_missed = 0
-    ins = np.searchsorted(ks_times, lh_times)
-    for lh_t, idx in zip(lh_times, ins):
-        best_uid, best_d = None, coincidence_samp + 1
-        if idx > 0:
-            d = abs(int(lh_t) - int(ks_times[idx - 1]))
-            if d < best_d:
-                best_d, best_uid = d, int(ks_units[idx - 1])
-        if idx < len(ks_times):
-            d = abs(int(lh_t) - int(ks_times[idx]))
-            if d < best_d:
-                best_d, best_uid = d, int(ks_units[idx])
-        if best_uid is not None and best_d <= coincidence_samp:
-            match_counts[best_uid] = match_counts.get(best_uid, 0) + 1
-        else:
-            n_missed += 1
+    for uid, unit_times in sorter_unit_map.items():
+        unit_times_sorted = np.sort(np.asarray(unit_times, dtype=np.int64))
+        n_m, _, _, _ = match_spikes(lh_times, unit_times_sorted, coincidence_samp)
+        if n_m > 0:
+            match_counts[uid] = n_m
 
     n_total = lh_times.size
     dominant_frac = (max(match_counts.values()) / n_total) if match_counts else 0.0
@@ -166,7 +155,7 @@ class QCSummaryDialog(QDialog):
             counts, edges = np.histogram(valid, bins=np.linspace(0, 100, 21))
             p.addItem(pg.BarGraphItem(
                 x=edges[:-1], height=counts, width=(edges[1]-edges[0])*0.9,
-                brush=pg.mkBrush("#2196F3"), pen=pg.mkPen("#1a1a1a"),
+                brush=pg.mkBrush(COLORS["sorter"]), pen=pg.mkPen("#1a1a1a"),
             ))
             p.setLabel("bottom", "Miss rate (%)")
             p.setLabel("left", "# channels")
@@ -174,12 +163,12 @@ class QCSummaryDialog(QDialog):
             med = float(np.nanmedian(valid))
             p.addItem(pg.InfiniteLine(
                 pos=med, angle=90,
-                pen=pg.mkPen("#FF9800", width=1.5, style=Qt.DashLine),
+                pen=pg.mkPen(COLORS["soup"], width=1.5, style=Qt.DashLine),
                 label=f"med={med:.1f}%",
-                labelOpts={"color": "#FF9800", "position": 0.85},
+                labelOpts={"color": COLORS["soup"], "position": 0.85},
             ))
         else:
-            lbl = pg.TextItem("No sorter loaded", color="#5A5C65", anchor=(0.5, 0.5))
+            lbl = pg.TextItem("No sorter loaded", color=COLORS["muted"], anchor=(0.5, 0.5))
             p.addItem(lbl)
             lbl.setPos(0.5, 0.5)
 
@@ -198,7 +187,7 @@ class QCSummaryDialog(QDialog):
                 else:
                     frag_counts[label] = int(np.sum(frag_arr == lo))
 
-            colors = ["#F44336", "#4CAF50", "#FF9800", "#9C27B0"]
+            colors = [COLORS["frag_missed"], COLORS["frag_clean"], COLORS["frag_split"], COLORS["frag_bad"]]
             labels = list(frag_counts.keys())
             vals   = list(frag_counts.values())
             xs = np.arange(len(labels), dtype=np.float64)
@@ -211,7 +200,7 @@ class QCSummaryDialog(QDialog):
             ax.setTicks([[(xi, lbl) for xi, lbl in zip(xs, labels)]])
             p.setLabel("left", "# LH channels")
         else:
-            lbl = pg.TextItem("No sorter loaded", color="#5A5C65", anchor=(0.5, 0.5))
+            lbl = pg.TextItem("No sorter loaded", color=COLORS["muted"], anchor=(0.5, 0.5))
             p.addItem(lbl)
             lbl.setPos(0.5, 0.5)
 
@@ -237,7 +226,7 @@ class QCSummaryDialog(QDialog):
             p.setLabel("left", "KS spike count")
         else:
             p.plot(lh_arr, ks_arr, pen=None, symbol="o",
-                   symbolSize=5, symbolBrush=pg.mkBrush("#4CAF50"))
+                   symbolSize=5, symbolBrush=pg.mkBrush(COLORS["lh"]))
             p.setLabel("bottom", "LH spike count")
             p.setLabel("left", "KS spike count (0 = no sorter)")
 
@@ -261,11 +250,11 @@ class QCSummaryDialog(QDialog):
                 brushes.append(pg.mkBrush(80, 80, 80, 180))
             elif not has_sorter:
                 # LH but no sorter — green shade by spike count
-                brushes.append(pg.mkBrush("#4CAF50"))
+                brushes.append(pg.mkBrush(COLORS["lh"]))
             else:
                 miss = miss_arr[channels_ordered.index(ch)] if ch in channels_ordered else np.nan
                 if np.isnan(miss):
-                    brushes.append(pg.mkBrush("#4CAF50"))
+                    brushes.append(pg.mkBrush(COLORS["lh"]))
                 else:
                     r_val = int(255 * miss)
                     g_val = int(255 * (1 - miss))

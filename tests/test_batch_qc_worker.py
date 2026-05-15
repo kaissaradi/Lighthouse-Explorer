@@ -5,7 +5,7 @@ import os
 import numpy as np
 import pytest
 
-from gui.workers import batch_qc_worker as batch_module
+from gui.workers import qc_worker as batch_module
 from tests.factories import make_qc_result
 
 

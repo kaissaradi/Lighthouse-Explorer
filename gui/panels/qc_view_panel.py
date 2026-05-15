@@ -8,15 +8,16 @@ import numpy as np
 from qtpy.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout
 from qtpy.QtCore import Qt
 from core.result_types import QCResult
+from gui.theme import COLORS as _THEME_COLORS
 
-# Colors
+# Re-export with the keys this module historically used (uppercase "LH")
 COLORS = {
-    "LH": "#4CAF50",
-    "soup": "#FF9800",
-    "uncertain_boundary": "#9E9E9E",
-    "uncertain_lowBL": "#757575",
-    "cluster0": "#2196F3",
-    "cluster1": "#FF9800",
+    "LH": _THEME_COLORS["lh"],
+    "soup": _THEME_COLORS["soup"],
+    "uncertain_boundary": _THEME_COLORS["uncertain_boundary"],
+    "uncertain_lowBL": _THEME_COLORS["uncertain_lowBL"],
+    "cluster0": _THEME_COLORS["cluster0"],
+    "cluster1": _THEME_COLORS["cluster1"],
 }
 
 
@@ -271,22 +272,9 @@ class QCViewPanel(QWidget):
             p.setTitle(f"LH vs KS Venn Diagram — CH {result.channel} (no LH spikes)")
             return
 
-        # 3. Fast two-pointer matching
-        matched = 0
-        i, j = 0, 0
-        while i < len(lh_times) and j < len(ks_times):
-            diff = lh_times[i] - ks_times[j]
-            if abs(diff) <= coincidence_samp:
-                matched += 1
-                i += 1
-                j += 1
-            elif diff < 0:
-                i += 1  # LH spike earlier
-            else:
-                j += 1  # KS spike earlier
-
-        lh_only = len(lh_times) - matched
-        ks_only = len(ks_times) - matched
+        # 3. Fast two-pointer matching (shared utility)
+        from core.spike_match import match_spikes
+        matched, lh_only, ks_only, _ = match_spikes(lh_times, ks_times, coincidence_samp)
 
         # 4. Draw the Venn Diagram 
         theta = np.linspace(0, 2 * np.pi, 100)
@@ -300,11 +288,11 @@ class QCViewPanel(QWidget):
         y_ks = r * np.sin(theta)
         
         # Add outlines
-        p.addItem(pg.PlotCurveItem(x_lh, y_lh, pen=pg.mkPen("#4CAF50", width=2))) # Green LH
-        p.addItem(pg.PlotCurveItem(x_ks, y_ks, pen=pg.mkPen("#2196F3", width=2))) # Blue KS
+        p.addItem(pg.PlotCurveItem(x_lh, y_lh, pen=pg.mkPen(COLORS["LH"], width=2))) # Green LH
+        p.addItem(pg.PlotCurveItem(x_ks, y_ks, pen=pg.mkPen(COLORS["cluster0"], width=2))) # Blue KS
         
         # Add Text Labels
-        text_lh = pg.TextItem(f"LH Only\n{lh_only}", color="#4CAF50", anchor=(0.5, 0.5))
+        text_lh = pg.TextItem(f"LH Only\n{lh_only}", color=COLORS["LH"], anchor=(0.5, 0.5))
         text_lh.setPos(-0.9, 0)
         p.addItem(text_lh)
         
@@ -312,7 +300,7 @@ class QCViewPanel(QWidget):
         text_both.setPos(0, 0)
         p.addItem(text_both)
         
-        text_ks = pg.TextItem(f"KS Only\n{ks_only}", color="#2196F3", anchor=(0.5, 0.5))
+        text_ks = pg.TextItem(f"KS Only\n{ks_only}", color=COLORS["cluster0"], anchor=(0.5, 0.5))
         text_ks.setPos(0.9, 0)
         p.addItem(text_ks)
 
@@ -355,11 +343,11 @@ class QCViewPanel(QWidget):
         if lh_times.size:
             lh_counts, _ = np.histogram(lh_times / fs, bins=bins)
             p.plot(bins[:-1], lh_counts.astype(np.float64),
-                   pen=pg.mkPen("#4CAF50", width=1.2), name="LH")
+                   pen=pg.mkPen(COLORS["LH"], width=1.2), name="LH")
         if sorter_times is not None and sorter_times.size:
             s_counts, _ = np.histogram(sorter_times / fs, bins=bins)
             p.plot(bins[:-1], s_counts.astype(np.float64),
-                   pen=pg.mkPen("#2196F3", width=1.2), name="KS")
+                   pen=pg.mkPen(COLORS["cluster0"], width=1.2), name="KS")
 
         has_ks = sorter_times is not None and sorter_times.size > 0
         p.setTitle(f"FR over time — CH {result.channel}" + ("" if has_ks else " (no KS)"))

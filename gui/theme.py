@@ -134,3 +134,32 @@ QStatusBar {
     padding: 2px 8px;
 }
 """
+
+
+# ── Semantic colour palette ─────────────────────────────────────────────────
+# Import from this dict in all GUI panels to keep colours consistent.
+COLORS = {
+    # QC labels
+    "lh": "#4CAF50",
+    "soup": "#FF9800",
+    "uncertain_boundary": "#9E9E9E",
+    "uncertain_lowBL": "#757575",
+    # PCA / waveform clusters
+    "cluster0": "#2196F3",
+    "cluster1": "#FF9800",
+    # Sorter / overlay
+    "sorter": "#2196F3",
+    # Fragmentation bar chart
+    "frag_missed": "#F44336",
+    "frag_clean": "#4CAF50",
+    "frag_split": "#FF9800",
+    "frag_bad": "#9C27B0",
+    # Error / status
+    "error": "#F44336",
+    # Histogram
+    "hist_fill": "#2E6DD4",
+    "hist_pen": "#4A8BEF",
+    # Muted / placeholder
+    "muted": "#5A5C65",
+    "muted_text": "#888888",
+}

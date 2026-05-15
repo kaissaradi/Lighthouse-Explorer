@@ -3,7 +3,7 @@ import numpy as np
 import psutil
 import os
 import gc
-from gui.workers.batch_qc_worker import BatchQCWorker
+from gui.workers.qc_worker import BatchQCWorker
 from qtpy.QtCore import QCoreApplication
 
 def get_memory_usage():

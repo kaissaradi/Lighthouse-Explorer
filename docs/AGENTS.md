@@ -19,18 +19,95 @@ Lighthouse Explorer is a high-speed quality control tool used by researchers to 
 ## 2. The Architecture & Data Pipeline
 
 * **`core/loader.py` & `core/lh_qc_pipeline.py`:** The pure Python science backend. Parses raw files and runs the 4-step pipeline (valley detection → snippet extraction → PCA/KMeans → BL/TR labeling). No Qt code belongs here.
-* **`gui/app.py` & `gui/main_window.py`:** The UI orchestration layer. The single source of truth for the application's state.
-* **`gui/workers/`:** All file I/O, heavy math, and batch processing executed via `QThread` or `QRunnable`.
+* **`gui/theme.py`:** Centralised dark stylesheet (`DARK_STYLESHEET`). All CSS lives here — not in `app.py`.
+* **`gui/app.py`:** Purely functional entry point. Creates `QApplication`, applies the stylesheet from `theme.py`, and launches `MainWindow`.
+* **`gui/main_window.py`:** The UI orchestration layer and single source of truth for application state. Delegates all background QC work to `TaskManager`.
+* **`gui/workers/qc_worker.py` → `TaskManager`:** Unified dispatch for both single-channel and batch QC. All tasks run as `QCChannelTask` (`QRunnable`) on a shared `QThreadPool`. There is no separate `QThread` boilerplate for QC — `TaskManager` owns the pool.
+* **`gui/workers/batch_qc_worker.py`:** Contains the `QCChannelTask(QRunnable)` and `QCChannelTaskSignals(QObject)` primitives, plus the legacy `BatchQCWorker` class (still used directly by some tests). `QCChannelTask` is the single unit of work for all QC execution.
+* **`gui/workers/loader_worker.py`:** File I/O worker. This one still uses `QObject` + `QThread` (appropriate for one-shot I/O, not pooled tasks).
 * **`gui/panels/`:** Thin UI layers using `pyqtgraph`. They do no heavy lifting and only react to state changes via Qt Signals.
 * **`lh_deps/`:** Vendored upstream utilities. **READ-ONLY.** Do not modify these files.
 
 ---
 
-## 3. Environment, Data, & Execution Rules
+## 3. Environment, Dependencies, & Execution Rules
 
-* **The Conda Environment:** Every terminal command you run MUST use the `lighthouse_qc` conda environment (e.g., `conda run -n lighthouse_qc pytest tests/`).
-* **OpenMP/BLAS Concurrency Rule (CRITICAL):** We use Scikit-Learn (PCA/KMeans) inside worker threads. You MUST pin native threads (`OMP_NUM_THREADS="1"`, `OPENBLAS_NUM_THREADS="1"`) at the task level before batch processing to prevent deadlocks and CPU thread explosion.
-* **Garbage Collection (Memory Leaks):** When writing `QThread` or `QRunnable` logic, you MUST implement `.deleteLater()` to clean up C++ object references upon task completion or abortion. Long-running GUI sessions will otherwise leak RAM.
+### 3.1 The Conda Environment
+
+Every terminal command you run MUST use the `lighthouse_qc` conda environment. There are two ways to do this:
+
+```bash
+# Option A: prefix every command (preferred for CI / one-shot commands)
+conda run -n lighthouse_qc <command>
+
+# Option B: activate in your shell first (preferred for interactive work)
+conda activate lighthouse_qc
+```
+
+### 3.2 PYTHONPATH Requirement (CRITICAL)
+
+This project does **not** have a `setup.py`, `pyproject.toml`, or `pip install -e .` configuration. The project root is **not** automatically on `sys.path`.
+
+When running tests or scripts via `conda run`, you **MUST** set `PYTHONPATH` to the project root, otherwise you will get `ModuleNotFoundError: No module named 'gui'` or `'core'`:
+
+```bash
+# ✅ Correct — tests can find gui/, core/, etc.
+conda run -n lighthouse_qc env PYTHONPATH=/path/to/Lighthouse-Explorer pytest tests/ -v
+
+# ❌ Wrong — will fail with ModuleNotFoundError
+conda run -n lighthouse_qc pytest tests/ -v
+```
+
+For `run.py`, the same applies:
+```bash
+conda run -n lighthouse_qc env PYTHONPATH=/path/to/Lighthouse-Explorer python run.py
+```
+
+### 3.3 Installing Test Dependencies
+
+Test-only packages (pytest, pytest-qt, pytest-mock, psutil) are listed in `requirements-test.txt` at the project root. Install them once into the conda env:
+
+```bash
+conda run -n lighthouse_qc pip install -r requirements-test.txt
+```
+
+The main application dependencies are in `requirements.txt`. Test deps are separate to keep the production env lean.
+
+### 3.4 Running Tests — Quick Reference
+
+```bash
+# Full test suite
+conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/ -v
+
+# Individual test files
+conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/test_batch_qc_worker.py -v
+conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/test_memory_leaks.py -v
+
+# Launch the app (blocks until window is closed; use timeout for smoke-test)
+conda run -n lighthouse_qc env PYTHONPATH=. timeout 5 python run.py
+# Exit code 124 = timeout killed it = app launched successfully
+```
+
+### 3.5 Qt Offscreen Mode
+
+Tests use `QT_QPA_PLATFORM=offscreen` (set in `tests/conftest.py`) so they run headlessly without a display server. Do not remove this from conftest.
+
+### 3.6 OpenMP/BLAS Concurrency Rule (CRITICAL)
+
+We use Scikit-Learn (PCA/KMeans) inside worker threads. You MUST pin native threads (`OMP_NUM_THREADS="1"`, `OPENBLAS_NUM_THREADS="1"`) at the task level before batch processing to prevent deadlocks and CPU thread explosion. This is enforced by:
+
+1. `core/native_threading.py` → `configure_native_thread_environment()` — sets env vars at process startup.
+2. `core/native_threading.py` → `native_thread_limits(1)` — runtime context manager using `threadpoolctl` inside each `QCChannelTask.run()`.
+
+Both layers are required. Env vars only affect libraries loaded *after* they're set; `threadpoolctl` handles already-loaded libraries.
+
+### 3.7 Garbage Collection (Memory Leaks)
+
+When writing `QRunnable` or `QThread` logic:
+
+* You MUST keep a Python reference to active tasks (`self._tasks.append(task)`) to prevent the Python GC from destroying the C++ `QRunnable` while the thread pool is still executing it.
+* You MUST call `.deleteLater()` on `QObject` signal holders upon task completion or abortion.
+* The memory leak regression test (`tests/test_memory_leaks.py`) verifies this. Run it after any worker changes.
 
 ---
 

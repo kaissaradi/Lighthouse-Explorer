@@ -7,7 +7,7 @@ import pytest
 
 from core import loader
 from core.lh_qc_pipeline import DEFAULT_PARAMS
-from gui.workers.batch_qc_worker import BatchQCWorker
+from gui.workers.qc_worker import BatchQCWorker
 from lh_deps.axolotl_utils_ram import (
     compute_baselines_int16_deriv_robust,
     subtract_segment_baselines_int16,
