@@ -10,8 +10,7 @@ from qtpy.QtCore import Qt, QThread
 from .panels.load_panel import LoadPanel
 from .panels.array_map_panel import ArrayMapPanel
 from .panels.qc_view_panel import QCViewPanel
-from .workers.qc_worker import QCWorker
-from .workers.batch_qc_worker import BatchQCWorker
+from .workers.qc_worker import TaskManager
 from .workers.loader_worker import LoaderWorker
 from core.lh_qc_pipeline import DEFAULT_PARAMS
 from core.result_types import QCResult
@@ -52,17 +51,38 @@ class MainWindow(QMainWindow):
         # ── Workers / threads ────────────────────────────────────────────────
         self._loader_thread: Optional[QThread] = None
         self._loader_worker: Optional[LoaderWorker] = None
-        self._single_thread: Optional[QThread] = None
-        self._single_worker: Optional[QCWorker] = None
-        self._batch_thread: Optional[QThread] = None
-        self._batch_worker: Optional[BatchQCWorker] = None
-        self._running_batch = False
+
+        # Unified task manager for single-channel AND batch QC.
+        self._task_manager = TaskManager(parent=self)
+        self._connect_task_manager()
 
         self._build_ui()
         self._connect_signals()
 
         if self.default_dat or self.default_n_channels:
             self._load_panel.set_defaults(self.default_dat, self.default_n_channels)
+
+    # ── TaskManager wiring ───────────────────────────────────────────────────
+
+    def _connect_task_manager(self):
+        """Wire TaskManager signals to MainWindow slots — once, at init."""
+        tm = self._task_manager
+
+        # Single-channel QC
+        tm.single_result.connect(self.on_single_qc_finished)
+        tm.single_error.connect(self.on_single_qc_error)
+        tm.single_progress.connect(self._status_message)
+
+        # Batch QC
+        tm.batch_progress.connect(self._on_batch_progress)
+        tm.batch_channel_done.connect(self._on_batch_channel_done)
+        tm.batch_finished.connect(self._on_batch_finished)
+        tm.batch_error.connect(self._on_batch_error)
+        tm.batch_aborted.connect(self._on_batch_aborted)
+
+    def _status_message(self, msg: str):
+        """Slot adapter: forward a plain string to the status bar."""
+        self._status_bar.showMessage(msg)
 
     # ── UI setup ─────────────────────────────────────────────────────────────
 
@@ -291,35 +311,18 @@ class MainWindow(QMainWindow):
     # ── Batch QC lifecycle ────────────────────────────────────────────────────
 
     def _start_batch_qc(self):
-        """Start running QC on all channels."""
+        """Start running QC on all channels via the unified TaskManager."""
         if self.raw_data is None:
             return
 
-        self._abort_batch_worker()
-        self._running_batch = True
+        self._task_manager.abort_batch()
         self._channel_list.hide_progress()
 
-        self._batch_thread = QThread()
-        self._batch_worker = BatchQCWorker(
+        self._task_manager.start_batch(
             raw_data=self.raw_data,
             params=self.lh_params,
             sorter_spike_times=self.sorter_spike_times,
         )
-        self._batch_worker.moveToThread(self._batch_thread)
-        self._batch_thread.started.connect(self._batch_worker.run)
-        self._batch_worker.progress.connect(self._on_batch_progress)
-        self._batch_worker.channel_done.connect(self._on_batch_channel_done)
-        self._batch_worker.finished.connect(self._on_batch_finished)
-        self._batch_worker.error.connect(self._on_batch_error)
-        self._batch_worker.aborted.connect(self._on_batch_aborted)
-
-        self._batch_worker.finished.connect(self._batch_thread.quit)
-        self._batch_worker.finished.connect(self._batch_worker.deleteLater)
-        self._batch_worker.error.connect(self._batch_thread.quit)
-        self._batch_worker.aborted.connect(self._batch_thread.quit)
-        self._batch_thread.finished.connect(self._batch_thread.deleteLater)
-
-        self._batch_thread.start()
 
     def _on_batch_progress(self, msg: str, current: int, total: int):
         self._status_bar.showMessage(msg)
@@ -359,7 +362,6 @@ class MainWindow(QMainWindow):
             self._qc_view.show_result(result)
 
     def _on_batch_finished(self, results: dict):
-        self._running_batch = False
         self._channel_list.hide_progress()
 
         lh_count = sum(1 for r in self.qc_results.values() if r.n_lh > 0)
@@ -378,28 +380,17 @@ class MainWindow(QMainWindow):
                 break
 
     def _on_batch_error(self, msg: str):
-        self._running_batch = False
         self._channel_list.hide_progress()
         self._status_bar.showMessage(f"Batch QC failed: {msg}")
         self._qc_view.show_error(msg)
 
     def _on_batch_aborted(self):
-        self._running_batch = False
         self._channel_list.hide_progress()
         self._status_bar.showMessage(
             f"Batch QC cancelled. {len(self.qc_results)} channels completed."
         )
 
     # ── Single QC lifecycle ───────────────────────────────────────────────────
-
-    def _abort_batch_worker(self):
-        if self._batch_worker:
-            try:
-                self._batch_worker.abort()
-            except RuntimeError:
-                pass # C++ object already deleted
-        if self._batch_thread and self._batch_thread.isRunning():
-            self._batch_thread.quit()
 
     def on_channel_selected(self, ch: int):
         """User clicked a channel in the list."""
@@ -415,48 +406,23 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage(f"CH {ch}: cached result displayed.")
             return
 
-        if self._running_batch:
+        if self._task_manager.is_batch_running:
             self._qc_view.show_loading(ch)
             self._status_bar.showMessage(f"CH {ch}: queued for batch QC…")
             return
 
-        self._abort_single_worker()
         self._qc_view.show_loading(ch)
-        self._start_single_qc_worker(ch)
+        self._start_single_qc(ch)
 
-    def _start_single_qc_worker(self, ch: int):
+    def _start_single_qc(self, ch: int):
+        """Dispatch a single-channel QC through the unified TaskManager."""
         n_sorter = self._n_sorter_spikes_for_channel(ch)
-
-        self._single_thread = QThread()
-        self._single_worker = QCWorker(
+        self._task_manager.start_single(
             raw_data=self.raw_data,
             channel=ch,
             n_sorter_spikes=n_sorter,
             params=self.lh_params,
         )
-        self._single_worker.moveToThread(self._single_thread)
-        self._single_thread.started.connect(self._single_worker.run)
-        self._single_worker.progress.connect(self._status_bar.showMessage)
-        self._single_worker.finished.connect(self.on_single_qc_finished)
-        self._single_worker.error.connect(self.on_single_qc_error)
-        self._single_worker.aborted.connect(self.on_single_qc_aborted)
-
-        self._single_worker.finished.connect(self._single_thread.quit)
-        self._single_worker.finished.connect(self._single_worker.deleteLater)
-        self._single_worker.error.connect(self._single_thread.quit)
-        self._single_worker.aborted.connect(self._single_thread.quit)
-        self._single_thread.finished.connect(self._single_thread.deleteLater)
-
-        self._single_thread.start()
-
-    def _abort_single_worker(self):
-        if self._single_worker is not None:
-            try:
-                self._single_worker.abort()
-            except RuntimeError:
-                pass
-        if self._single_thread is not None and self._single_thread.isRunning():
-            self._single_thread.quit()
 
     def on_single_qc_finished(self, result: QCResult):
         ch = result.channel
@@ -473,9 +439,6 @@ class MainWindow(QMainWindow):
     def on_single_qc_error(self, msg: str):
         self._status_bar.showMessage(f"QC failed: {msg}")
         self._qc_view.show_error(msg)
-
-    def on_single_qc_aborted(self):
-        self._status_bar.showMessage(f"CH {self.current_channel}: QC cancelled.")
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
@@ -503,6 +466,5 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._abort_loader()
-        self._abort_batch_worker()
-        self._abort_single_worker()
+        self._task_manager.abort_batch()
         event.accept()

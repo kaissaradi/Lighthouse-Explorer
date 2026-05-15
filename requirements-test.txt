@@ -1,0 +1,6 @@
+# Test dependencies for the lighthouse_qc conda environment.
+# Install with: pip install -r requirements-test.txt
+pytest
+pytest-qt
+pytest-mock
+psutil
