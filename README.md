@@ -46,6 +46,15 @@ For power users, you can specify default paths:
 python run.py --dat /path/to/data.dat --n_channels 512
 ```
 
+## Documentation
+
+Detailed documentation on development and usage is available in the `docs/` folder:
+
+- [Getting Started](docs/GETTING_STARTED.md)
+- [File Tree](docs/FILE_TREE.md)
+- [Development Process (TDD/SPEC-DD)](docs/DEVELOPMENT_PROCESS.md)
+- [Environment Management](docs/ENVIRONMENT.md)
+
 ## Repository Structure
 
 ```

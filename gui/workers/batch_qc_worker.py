@@ -5,17 +5,42 @@ from __future__ import annotations
 import os
 import traceback
 from qtpy.QtCore import QObject, Signal, QRunnable, QThreadPool
+from core.native_threading import (
+    configure_native_thread_environment,
+    native_thread_limits,
+)
 
 # PREVENT OPENMP DEADLOCKS: Force NumPy/SciPy/Scikit-Learn to use 1 thread per task.
-# This must happen before the pipeline runs, otherwise 8 concurrent KMeans calls
-# will spawn 64+ threads and crash the C++ backend.
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# These defaults help when this module is imported early. Each task also uses
+# threadpoolctl at runtime because NumPy/scikit-learn may already be loaded.
+configure_native_thread_environment()
 
 from core.lh_qc_pipeline import run_qc_pipeline, DEFAULT_PARAMS
 from core.result_types import QCResult
+
+
+DEFAULT_BATCH_MAX_WORKERS = 4
+DEFAULT_NATIVE_THREADS_PER_TASK = 1
+
+
+def _positive_int(value, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def _resolve_worker_count(params: dict, explicit_count=None) -> int:
+    if explicit_count is not None:
+        return _positive_int(explicit_count, DEFAULT_BATCH_MAX_WORKERS)
+
+    if params and params.get("batch_max_workers") is not None:
+        return _positive_int(params.get("batch_max_workers"), DEFAULT_BATCH_MAX_WORKERS)
+
+    return _positive_int(
+        os.environ.get("LIGHTHOUSE_QC_BATCH_THREADS"),
+        DEFAULT_BATCH_MAX_WORKERS,
+    )
 
 
 class QCChannelTaskSignals(QObject):
@@ -27,24 +52,34 @@ class QCChannelTaskSignals(QObject):
 class QCChannelTask(QRunnable):
     """A worker task that runs QC on a single channel."""
     
-    def __init__(self, raw_data, ch: int, n_sorter: int, params: dict, fs: float):
+    def __init__(
+        self,
+        raw_data,
+        ch: int,
+        n_sorter: int,
+        params: dict,
+        fs: float,
+        native_threads: int = DEFAULT_NATIVE_THREADS_PER_TASK,
+    ):
         super().__init__()
         self.raw_data = raw_data
         self.ch = ch
         self.n_sorter = n_sorter
         self.params = params
         self.fs = fs
+        self.native_threads = _positive_int(native_threads, DEFAULT_NATIVE_THREADS_PER_TASK)
         self.signals = QCChannelTaskSignals()
 
     def run(self):
         try:
-            result = run_qc_pipeline(
-                raw_data=self.raw_data,
-                ch=self.ch,
-                n_sorter_spikes=self.n_sorter,
-                params=self.params,
-                fs=self.fs,
-            )
+            with native_thread_limits(self.native_threads):
+                result = run_qc_pipeline(
+                    raw_data=self.raw_data,
+                    ch=self.ch,
+                    n_sorter_spikes=self.n_sorter,
+                    params=self.params,
+                    fs=self.fs,
+                )
             self.signals.result_ready.emit(result)
         except Exception as e:
             # Capture the full traceback
@@ -67,12 +102,19 @@ class BatchQCWorker(QObject):
         params: dict,
         sorter_spike_times: dict = None,
         fs: float = 20000.0,
+        max_workers: int | None = None,
+        native_threads_per_task: int = DEFAULT_NATIVE_THREADS_PER_TASK,
     ):
         super().__init__()
         self.raw_data = raw_data
         self.params = params if params else dict(DEFAULT_PARAMS)
         self.sorter_spike_times = sorter_spike_times or {}
         self.fs = fs
+        self.max_workers = _resolve_worker_count(self.params, max_workers)
+        self.native_threads_per_task = _positive_int(
+            native_threads_per_task,
+            DEFAULT_NATIVE_THREADS_PER_TASK,
+        )
         
         self._abort = False
         self._completed_count = 0
@@ -80,12 +122,13 @@ class BatchQCWorker(QObject):
         self._tasks = []  # <--- CRITICAL: Prevents Python Garbage Collector from killing tasks
         
         self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(1)  
+        self._pool.setMaxThreadCount(self.max_workers)
 
     def abort(self):
         """Signal the worker to stop and clear pending tasks."""
         self._abort = True
         self._pool.clear()
+        self._tasks.clear()  # <--- Ensure tasks are cleared on abort too
         self.aborted.emit()
 
     def run(self):
@@ -107,7 +150,8 @@ class BatchQCWorker(QObject):
                     ch=ch,
                     n_sorter=n_sorter,
                     params=self.params,
-                    fs=self.fs
+                    fs=self.fs,
+                    native_threads=self.native_threads_per_task,
                 )
                 
                 task.signals.result_ready.connect(self._on_task_result)

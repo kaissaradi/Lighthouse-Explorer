@@ -112,6 +112,18 @@ class MainWindow(QMainWindow):
 
     def on_load_requested(self, params: dict):
         """Start background loading — supports flat .dat/.bin and Litke bin folder."""
+        # 1. Clear old state BEFORE starting new load
+        self.raw_data = None
+        self.qc_results.clear()
+        self.sorter_spike_times.clear()
+        self.sorter_unit_map.clear()
+        self.sorter_dom_channel.clear()
+        self.current_channel = None
+        
+        self._qc_view.clear()
+        self._channel_list.clear()
+        self._summary_btn.setEnabled(False)
+
         self.lh_params.update(params)
 
         dat_path = params.get("dat_path")
@@ -382,7 +394,10 @@ class MainWindow(QMainWindow):
 
     def _abort_batch_worker(self):
         if self._batch_worker:
-            self._batch_worker.abort()
+            try:
+                self._batch_worker.abort()
+            except RuntimeError:
+                pass # C++ object already deleted
         if self._batch_thread and self._batch_thread.isRunning():
             self._batch_thread.quit()
 
@@ -436,7 +451,10 @@ class MainWindow(QMainWindow):
 
     def _abort_single_worker(self):
         if self._single_worker is not None:
-            self._single_worker.abort()
+            try:
+                self._single_worker.abort()
+            except RuntimeError:
+                pass
         if self._single_thread is not None and self._single_thread.isRunning():
             self._single_thread.quit()
 
@@ -485,12 +503,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._abort_loader()
-        if self._batch_worker:
-            self._batch_worker.abort()
-        if self._single_worker:
-            self._single_worker.abort()
-        if self._batch_thread and self._batch_thread.isRunning():
-            self._batch_thread.quit()
-        if self._single_thread and self._single_thread.isRunning():
-            self._single_thread.quit()
+        self._abort_batch_worker()
+        self._abort_single_worker()
         event.accept()

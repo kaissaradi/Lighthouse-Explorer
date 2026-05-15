@@ -3,6 +3,13 @@ qc_worker.py — Background worker for QC pipeline execution.
 """
 from __future__ import annotations
 from qtpy.QtCore import QObject, Signal
+from core.native_threading import (
+    configure_native_thread_environment,
+    native_thread_limits,
+)
+
+configure_native_thread_environment()
+
 from core.lh_qc_pipeline import run_qc_pipeline, DEFAULT_PARAMS
 
 
@@ -42,13 +49,14 @@ class QCWorker(QObject):
                 self.aborted.emit()
                 return
 
-            result = run_qc_pipeline(
-                raw_data=self.raw_data,
-                ch=self.channel,
-                n_sorter_spikes=self.n_sorter_spikes,
-                params=self.params,
-                fs=self.fs,
-            )
+            with native_thread_limits(1):
+                result = run_qc_pipeline(
+                    raw_data=self.raw_data,
+                    ch=self.channel,
+                    n_sorter_spikes=self.n_sorter_spikes,
+                    params=self.params,
+                    fs=self.fs,
+                )
 
             if self._abort:
                 self.aborted.emit()

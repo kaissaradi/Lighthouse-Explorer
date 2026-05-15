@@ -1088,6 +1088,98 @@ def run_bltr_support(
     )
 
 
+def compute_biophysics(
+    raw_data: np.ndarray,
+    detect_ch: int,
+    spike_times: np.ndarray,
+    fs: float,
+    duration_s: float,
+    window: tuple[int, int] = (-20, 40),
+) -> dict:
+    """
+    Calculate physiological ground-truth metrics for a set of spike times.
+    """
+    if spike_times.size < 2:
+        return {
+            "firing_rate_hz": spike_times.size / max(0.001, duration_s),
+            "isi_violations_pct": 0.0,
+            "burst_fraction_pct": 0.0,
+            "trough_to_peak_ms": 0.0,
+            "peak_to_trough_ratio": 0.0,
+            "median_amp_adc": 0.0,
+        }
+
+    # 1. Temporal Metrics
+    sorted_times = np.sort(spike_times)
+    diffs_ms = np.diff(sorted_times) / fs * 1000.0
+    isi_violations = np.sum(diffs_ms < 1.5)
+    burst_fraction = np.sum(diffs_ms < 5.0)
+    
+    # Percentages based on number of intervals
+    n_intervals = diffs_ms.size
+    isi_violations_pct = float(isi_violations / n_intervals * 100.0)
+    burst_fraction_pct = float(burst_fraction / n_intervals * 100.0)
+    firing_rate_hz = float(spike_times.size / duration_s)
+
+    # 2. Waveform Metrics (on a subset to be fast)
+    # Extract mean waveform
+    MAX_FOR_MEAN = 500
+    if spike_times.size > MAX_FOR_MEAN:
+        rng = np.random.RandomState(42)
+        subset_times = rng.choice(spike_times, MAX_FOR_MEAN, replace=False)
+    else:
+        subset_times = spike_times
+    
+    # extract_snippets_fast_ram expects [ch1, ch2, ...]
+    snips, valid = extract_snippets_fast_ram(
+        raw_data, subset_times, window=window, selected_channels=np.array([detect_ch], dtype=np.int32)
+    )
+    
+    if snips.size == 0:
+        return {
+            "firing_rate_hz": firing_rate_hz,
+            "isi_violations_pct": isi_violations_pct,
+            "burst_fraction_pct": burst_fraction_pct,
+            "trough_to_peak_ms": 0.0,
+            "peak_to_trough_ratio": 0.0,
+            "median_amp_adc": 0.0,
+        }
+    
+    # snips shape is [1, L, N]
+    mean_wf = np.mean(snips[0], axis=1) # [L]
+    
+    # Metrics based on mean waveform
+    # Assume trough is at window[0] offset (usually 20 samples in)
+    # But let's be more robust: find the global minimum in the snippet
+    trough_idx = np.argmin(mean_wf)
+    trough_val = mean_wf[trough_idx]
+    
+    # Peak is the maximum AFTER the trough
+    if trough_idx < mean_wf.size - 1:
+        peak_idx = trough_idx + np.argmax(mean_wf[trough_idx:])
+        peak_val = mean_wf[peak_idx]
+        trough_to_peak_ms = float((peak_idx - trough_idx) / fs * 1000.0)
+    else:
+        peak_val = 0.0
+        trough_to_peak_ms = 0.0
+        
+    peak_to_trough_ratio = float(abs(peak_val) / max(1.0, abs(trough_val)))
+    
+    # Median absolute amplitude of individual spikes at their own trough
+    # (not just the mean waveform trough)
+    # Actually, easier to just use the min per snippet
+    median_amp_adc = float(np.median(np.abs(np.min(snips[0], axis=0))))
+
+    return {
+        "firing_rate_hz": firing_rate_hz,
+        "isi_violations_pct": isi_violations_pct,
+        "burst_fraction_pct": burst_fraction_pct,
+        "trough_to_peak_ms": trough_to_peak_ms,
+        "peak_to_trough_ratio": peak_to_trough_ratio,
+        "median_amp_adc": median_amp_adc,
+    }
+
+
 def run_qc_pipeline(
     raw_data: np.ndarray,
     ch: int,
@@ -1147,6 +1239,18 @@ def run_qc_pipeline(
         snippet_len=snippet_len,
     )
 
+    # ── Step 4: Biophysics Extraction ─────────────────────────────────────
+    # Calculate physiological metrics on the final spikes
+    duration_s = raw_data.shape[0] / fs
+    biophysics = compute_biophysics(
+        raw_data=raw_data,
+        detect_ch=ch,
+        spike_times=final_times,
+        fs=fs,
+        duration_s=duration_s,
+        window=params.get("window", (-20, 40))
+    )
+
     return QCResult(
         channel=ch,
         n_sorter_spikes=n_sorter_spikes,
@@ -1154,6 +1258,9 @@ def run_qc_pipeline(
         snippets=dummy_snippets,
         pca_km=pca_km,
         bltr=bltr,
+        biophysics=biophysics,
+        km_info=km_info,
+        fs=fs
     )
 
 

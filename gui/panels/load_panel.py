@@ -117,6 +117,22 @@ class LoadPanel(QWidget):
         param_grp.setLayout(param_layout)
         layout.addWidget(param_grp)
 
+        # ── Batch execution ───────────────────────────────────────
+        exec_grp = QGroupBox("Batch QC")
+        exec_layout = QVBoxLayout()
+
+        self._batch_workers = QSpinBox()
+        self._batch_workers.setRange(1, 32)
+        self._batch_workers.setValue(4)
+        self._batch_workers.setToolTip(
+            "Number of channels to process concurrently. Native BLAS/OpenMP "
+            "threads stay pinned to one per channel."
+        )
+        self._add_row(exec_layout, "QC workers", self._batch_workers)
+
+        exec_grp.setLayout(exec_layout)
+        layout.addWidget(exec_grp)
+
         layout.addStretch()
 
         # ── Load Button ────────────────────────────────────────────
@@ -229,6 +245,7 @@ class LoadPanel(QWidget):
             "support_min_bl_bulk": self._min_bl_bulk.value(),
             "min_trough": self._min_trough.value(),
             "bin_width": self._bin_width.value(),
+            "batch_max_workers": self._batch_workers.value(),
         }
         return params
 
