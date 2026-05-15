@@ -273,7 +273,7 @@ class QCViewPanel(QWidget):
             return
 
         # 3. Fast two-pointer matching (shared utility)
-        from core.spike_match import match_spikes
+        from core.loader import match_spikes
         matched, lh_only, ks_only, _ = match_spikes(lh_times, ks_times, coincidence_samp)
 
         # 4. Draw the Venn Diagram 

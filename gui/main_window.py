@@ -10,8 +10,7 @@ from qtpy.QtCore import Qt, QThread
 from .panels.load_panel import LoadPanel
 from .panels.array_map_panel import ArrayMapPanel
 from .panels.qc_view_panel import QCViewPanel
-from .workers.qc_worker import TaskManager
-from .workers.loader_worker import LoaderWorker
+from .workers.qc_worker import TaskManager, LoaderWorker
 from core.lh_qc_pipeline import DEFAULT_PARAMS
 from core.result_types import QCResult
 from .panels.qc_summary_dialog import QCSummaryDialog

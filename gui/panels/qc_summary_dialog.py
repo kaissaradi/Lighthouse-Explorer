@@ -29,7 +29,7 @@ def _fragmentation_index(sorter_unit_map: dict, lh_times: np.ndarray, fs: float)
     if not sorter_unit_map or lh_times.size == 0:
         return None
 
-    from core.spike_match import match_spikes
+    from core.loader import match_spikes
 
     coincidence_samp = int(0.001 * fs)
 

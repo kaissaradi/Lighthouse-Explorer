@@ -5,7 +5,7 @@ Entry point for Lighthouse QC GUI application.
 
 import sys
 import argparse
-from core.native_threading import configure_native_thread_environment
+from gui.workers import configure_native_thread_environment
 
 
 def main():

@@ -1,10 +1,10 @@
-"""Tests for core.spike_match — shared spike coincidence matching."""
+"""Tests for core.loader — shared spike coincidence matching."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from core.spike_match import match_spikes
+from core.loader import match_spikes
 
 
 class TestMatchSpikes:
