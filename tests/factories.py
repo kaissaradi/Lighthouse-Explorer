@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from core.result_types import (
+from core.lh_qc_pipeline import (
     BLTRResult,
     PCAKMeansResult,
     QCResult,

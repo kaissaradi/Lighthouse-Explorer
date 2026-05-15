@@ -1,6 +1,6 @@
 
 import numpy as np
-from core.result_types import QCResult, ValleyResult, SnippetResult, PCAKMeansResult, BLTRResult
+from core.lh_qc_pipeline import QCResult, ValleyResult, SnippetResult, PCAKMeansResult, BLTRResult
 
 def test_qc_result_properties():
     valley = ValleyResult(

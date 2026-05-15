@@ -4,8 +4,12 @@ Entry point for Lighthouse QC GUI application.
 """
 
 import sys
+
+import warnings
+warnings.filterwarnings("ignore", message="overflow encountered in cast", category=RuntimeWarning, module="pyqtgraph.*")
+
 import argparse
-from gui.workers import configure_native_thread_environment
+from core import configure_native_thread_environment
 
 
 def main():
@@ -19,7 +23,7 @@ def main():
     args = parser.parse_args()
 
     # Run the app
-    from gui.app import run
+    from gui.main_window import run
 
     run(sys.argv, default_dat=args.dat, default_n_channels=args.n_channels)
 

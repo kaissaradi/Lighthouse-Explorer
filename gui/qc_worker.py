@@ -20,61 +20,25 @@ from __future__ import annotations
 
 import os
 import traceback
-from contextlib import nullcontext
 from qtpy.QtCore import QObject, Signal, QRunnable, QThreadPool
 
+from core import configure_native_thread_environment, native_thread_limits
+
+# Numba threading layer and BLAS limits must be set before lh_deps (Numba) load.
+configure_native_thread_environment()
+
 from core import loader
-from lh_deps.axolotl_utils_ram import (
+from core.lh_qc_pipeline import (
     compute_baselines_int16_deriv_robust,
     subtract_segment_baselines_int16,
 )
-
-
-# ── Native threading limits ─────────────────────────────────────────────────
-# Inlined from the former core/native_threading.py to reduce file count.
-
-NATIVE_THREAD_ENV_VARS = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-)
-
-
-def configure_native_thread_environment(threads: int = 1) -> None:
-    """
-    Set process-level limits before NumPy/SciPy/scikit-learn are imported.
-
-    These variables only reliably affect native libraries before they are loaded,
-    so channel workers also use ``native_thread_limits`` at runtime.
-    """
-    value = str(max(1, int(threads)))
-    for name in NATIVE_THREAD_ENV_VARS:
-        os.environ[name] = value
-
-
-def native_thread_limits(threads: int = 1):
-    """Return a context manager that limits already-loaded BLAS/OpenMP pools."""
-    try:
-        from threadpoolctl import threadpool_limits
-    except Exception:
-        return nullcontext()
-
-    return threadpool_limits(limits=max(1, int(threads)))
-
-
-# PREVENT OPENMP DEADLOCKS: Force NumPy/SciPy/Scikit-Learn to use 1 thread per task.
-# These defaults help when this module is imported early. Each task also uses
-# threadpoolctl at runtime because NumPy/scikit-learn may already be loaded.
-configure_native_thread_environment()
-
 from core.lh_qc_pipeline import run_qc_pipeline, DEFAULT_PARAMS
-from core.result_types import QCResult
+from core.lh_qc_pipeline import QCResult
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_BATCH_MAX_WORKERS = 4
+DEFAULT_BATCH_MAX_WORKERS = 1
 DEFAULT_NATIVE_THREADS_PER_TASK = 1
 
 
@@ -88,16 +52,15 @@ def _positive_int(value, default: int) -> int:
 
 
 def _resolve_worker_count(params: dict, explicit_count=None) -> int:
-    if explicit_count is not None:
-        return _positive_int(explicit_count, DEFAULT_BATCH_MAX_WORKERS)
+    return 1  # Parallel execution disabled
 
-    if params and params.get("batch_max_workers") is not None:
-        return _positive_int(params.get("batch_max_workers"), DEFAULT_BATCH_MAX_WORKERS)
 
-    return _positive_int(
-        os.environ.get("LIGHTHOUSE_QC_BATCH_THREADS"),
-        DEFAULT_BATCH_MAX_WORKERS,
-    )
+def _resolve_fs(params: dict | None, explicit_fs: float | None = None) -> float:
+    if explicit_fs is not None:
+        return float(explicit_fs)
+    if params and params.get("fs") is not None:
+        return float(params["fs"])
+    return 20_000.0
 
 
 # ── QCChannelTask primitives ────────────────────────────────────────────────
@@ -141,7 +104,6 @@ class QCChannelTask(QRunnable):
                 )
             self.signals.result_ready.emit(result)
         except Exception as e:
-            # Capture the full traceback
             err_msg = f"{str(e)}\n{traceback.format_exc()}"
             self.signals.error.emit({"ch": self.ch, "msg": err_msg})
 
@@ -335,20 +297,22 @@ class TaskManager(QObject):
         channel: int,
         n_sorter_spikes: int,
         params: dict,
-        fs: float = 20000.0,
+        fs: float | None = None,
     ) -> None:
         """
         Submit a single-channel QC task to the thread pool.
 
         Results are emitted via ``single_result`` / ``single_error``.
         """
+        params = params if params else dict(DEFAULT_PARAMS)
+        fs = _resolve_fs(params, fs)
         self.single_progress.emit(f"Running QC on CH {channel}...")
 
         task = QCChannelTask(
             raw_data=raw_data,
             ch=channel,
             n_sorter=n_sorter_spikes,
-            params=params if params else dict(DEFAULT_PARAMS),
+            params=params,
             fs=fs,
             native_threads=self.native_threads_per_task,
         )
@@ -388,7 +352,7 @@ class TaskManager(QObject):
         raw_data,
         params: dict,
         sorter_spike_times: dict | None = None,
-        fs: float = 20000.0,
+        fs: float | None = None,
     ) -> None:
         """
         Submit QC tasks for every channel in ``raw_data`` to the thread pool.
@@ -403,6 +367,9 @@ class TaskManager(QObject):
             self._running_batch = True
             sorter_spike_times = sorter_spike_times or {}
             params = params if params else dict(DEFAULT_PARAMS)
+            fs = _resolve_fs(params, fs)
+            self.max_workers = _resolve_worker_count(params, None)
+            self._pool.setMaxThreadCount(self.max_workers)
 
             _, n_channels = raw_data.shape
             self._batch_total = n_channels
@@ -491,7 +458,7 @@ class TaskManager(QObject):
         remaining = []
         for task in self._tasks:
             if task.ch == ch:
-                task.signals.deleteLater()
+                pass  # Removed to prevent wrapped C/C++ object deletion crash
             else:
                 remaining.append(task)
         self._tasks = remaining

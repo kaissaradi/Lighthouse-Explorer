@@ -1,19 +1,182 @@
+from __future__ import annotations
+"""
+theme.py — Centralised dark stylesheet for Lighthouse QC.
+
+Extracted from gui/app.py so the application entry point stays purely functional.
+"""
+
+DARK_STYLESHEET = """
+/* ── Base ───────────────────────────── */
+QWidget {
+    background-color: #111214;
+    color: #F0F0F2;
+    font-family: 'Inter', 'Segoe UI', sans-serif;
+    font-size: 12px;
+}
+QMainWindow, QDialog {
+    background-color: #111214;
+}
+
+/* ── Splitter handles ────────────────── */
+QSplitter::handle {
+    background: #2E3038;
+}
+QSplitter::handle:horizontal { width: 4px; }
+QSplitter::handle:vertical { height: 4px; }
+QSplitter::handle:hover { background: #4A8BEF; }
+
+/* ── Buttons ─────────────────────────── */
+QPushButton {
+    background-color: transparent;
+    border: 0.5px solid #3D3F48;
+    color: #9B9DA6;
+    padding: 5px 12px;
+    border-radius: 5px;
+    font-size: 12px;
+}
+QPushButton:hover {
+    background-color: #1E2025;
+    border-color: #5A5C65;
+    color: #F0F0F2;
+}
+QPushButton:pressed {
+    background-color: #282A30;
+}
+QPushButton:disabled {
+    color: #3A3C44;
+    border-color: #2E3038;
+}
+
+/* ── Labels ──────────────────────────── */
+QLabel {
+    color: #9B9DA6;
+    font-size: 12px;
+}
+
+/* ── Inputs ──────────────────────────── */
+QLineEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #18191C;
+    border: 0.5px solid #3D3F48;
+    border-radius: 4px;
+    padding: 3px 6px;
+    color: #F0F0F2;
+    font-size: 12px;
+}
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border-color: #5A5C65;
+}
+
+/* ── ComboBox ────────────────────────── */
+QComboBox {
+    background-color: #18191C;
+    border: 0.5px solid #3D3F48;
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: #F0F0F2;
+    min-height: 22px;
+}
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView {
+    background-color: #282A30;
+    color: #F0F0F2;
+    selection-background-color: rgba(46, 109, 212, 0.25);
+}
+
+/* ── GroupBox ────────────────────────── */
+QGroupBox {
+    border: 0.5px solid #2E3038;
+    border-radius: 5px;
+    margin-top: 10px;
+    padding-top: 12px;
+    font-weight: bold;
+    color: #9B9DA6;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 5px;
+}
+
+/* ── Scrollbars ──────────────────────── */
+QScrollBar:vertical {
+    background: #18191C;
+    width: 6px;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical {
+    background: #3D3F48;
+    border-radius: 3px;
+    min-height: 20px;
+}
+QScrollBar::handle:vertical:hover { background: #5A5C65; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+
+/* ── Progress bar ────────────────────── */
+QProgressBar {
+    background-color: #18191C;
+    border: 0.5px solid #3D3F48;
+    border-radius: 4px;
+    text-align: center;
+    color: #9B9DA6;
+    font-size: 11px;
+    height: 8px;
+}
+QProgressBar::chunk {
+    background-color: #2E6DD4;
+    border-radius: 3px;
+}
+
+/* ── Status bar ──────────────────────── */
+QStatusBar {
+    color: #5A5C65;
+    font-size: 11px;
+    border-top: 0.5px solid #2E3038;
+    background: #111214;
+    padding: 2px 8px;
+}
+"""
+
+
+# ── Semantic colour palette ─────────────────────────────────────────────────
+# Import from this dict in all GUI panels to keep colours consistent.
+COLORS = {
+    # QC labels
+    "lh": "#4CAF50",
+    "soup": "#FF9800",
+    "uncertain_boundary": "#9E9E9E",
+    "uncertain_lowBL": "#757575",
+    # PCA / waveform clusters
+    "cluster0": "#2196F3",
+    "cluster1": "#FF9800",
+    # Sorter / overlay
+    "sorter": "#2196F3",
+    # Fragmentation bar chart
+    "frag_missed": "#F44336",
+    "frag_clean": "#4CAF50",
+    "frag_split": "#FF9800",
+    "frag_bad": "#9C27B0",
+    # Error / status
+    "error": "#F44336",
+    # Histogram
+    "hist_fill": "#2E6DD4",
+    "hist_pen": "#4A8BEF",
+    # Muted / placeholder
+    "muted": "#5A5C65",
+    "muted_text": "#888888",
+}
+
+from .panels import LoadPanel, ArrayMapPanel, QCViewPanel, QCSummaryDialog
 """
 main_window.py — Top-level QMainWindow. Orchestrates panels and QC workflow.
 """
-from __future__ import annotations
 from typing import Optional
 import numpy as np
 import os
 from qtpy.QtWidgets import QMainWindow, QSplitter, QProgressBar, QPushButton
 from qtpy.QtCore import Qt, QThread
-from .panels.load_panel import LoadPanel
-from .panels.array_map_panel import ArrayMapPanel
-from .panels.qc_view_panel import QCViewPanel
-from .workers.qc_worker import TaskManager, LoaderWorker
+from .qc_worker import TaskManager, LoaderWorker
 from core.lh_qc_pipeline import DEFAULT_PARAMS
-from core.result_types import QCResult
-from .panels.qc_summary_dialog import QCSummaryDialog
+from core.lh_qc_pipeline import QCResult
 
 
 class MainWindow(QMainWindow):
@@ -321,6 +484,7 @@ class MainWindow(QMainWindow):
             raw_data=self.raw_data,
             params=self.lh_params,
             sorter_spike_times=self.sorter_spike_times,
+            fs=self.lh_params.get("fs"),
         )
 
     def _on_batch_progress(self, msg: str, current: int, total: int):
@@ -421,6 +585,7 @@ class MainWindow(QMainWindow):
             channel=ch,
             n_sorter_spikes=n_sorter,
             params=self.lh_params,
+            fs=self.lh_params.get("fs"),
         )
 
     def on_single_qc_finished(self, result: QCResult):
@@ -467,3 +632,36 @@ class MainWindow(QMainWindow):
         self._abort_loader()
         self._task_manager.abort_batch()
         event.accept()
+
+"""
+app.py — QApplication setup and entry point.
+
+The dark stylesheet lives in gui/theme.py.
+"""
+import sys
+from qtpy.QtWidgets import QApplication
+
+
+def create_app(argv) -> tuple[QApplication, MainWindow]:
+    """Build QApplication, apply stylesheet, return (app, window)."""
+    app = QApplication(argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(DARK_STYLESHEET)
+    window = MainWindow()
+    return app, window
+
+
+def run(argv=None, default_dat=None, default_n_channels=None):
+    """Full entry: create_app → show → exec."""
+    if argv is None:
+        argv = sys.argv
+    app, window = create_app(argv)
+
+    # Apply CLI defaults
+    if default_dat:
+        window.default_dat = default_dat
+    if default_n_channels:
+        window.default_n_channels = default_n_channels
+
+    window.show()
+    sys.exit(app.exec_())
