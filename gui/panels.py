@@ -231,7 +231,6 @@ class LoadPanel(QWidget):
             "support_min_bl_bulk": self._min_bl_bulk.value(),
             "min_trough": self._min_trough.value(),
             "bin_width": self._bin_width.value(),
-            "batch_max_workers": 1,
         }
         return params
 
@@ -928,7 +927,7 @@ from typing import Optional
 import numpy as np
 import pyqtgraph as pg
 from qtpy.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSizePolicy
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
 )
 from qtpy.QtCore import Qt
 

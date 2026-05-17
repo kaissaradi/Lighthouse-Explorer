@@ -4,7 +4,6 @@ qc_worker.py — Unified worker module for all background tasks.
 Contains:
   • Native threading helpers (configure_native_thread_environment, native_thread_limits)
   • QCChannelTaskSignals / QCChannelTask — the atomic QRunnable unit
-  • BatchQCWorker — legacy dispatcher (used directly by some tests)
   • TaskManager — single-channel + batch dispatch via shared QThreadPool
   • LoaderWorker — file I/O + baseline subtraction on a background QThread
 
@@ -38,7 +37,6 @@ from core.lh_qc_pipeline import QCResult
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_BATCH_MAX_WORKERS = 1
 DEFAULT_NATIVE_THREADS_PER_TASK = 1
 
 
@@ -49,10 +47,6 @@ def _positive_int(value, default: int) -> int:
         return max(1, int(value))
     except (TypeError, ValueError):
         return max(1, int(default))
-
-
-def _resolve_worker_count(params: dict, explicit_count=None) -> int:
-    return 1  # Parallel execution disabled
 
 
 def _resolve_fs(params: dict | None, explicit_fs: float | None = None) -> float:
@@ -108,124 +102,6 @@ class QCChannelTask(QRunnable):
             self.signals.error.emit({"ch": self.ch, "msg": err_msg})
 
 
-# ── BatchQCWorker (legacy dispatcher) ───────────────────────────────────────
-
-class BatchQCWorker(QObject):
-    """Dispatches QC tasks to a QThreadPool and aggregates results sequentially for the UI."""
-
-    progress = Signal(str, int, int)  # (message, current_channel, total_channels)
-    channel_done = Signal(object)     # emits QCResult for each completed channel
-    finished = Signal(dict)           # emits {ch: QCResult} dict when all done
-    error = Signal(str)               # emits error message string (Fatal errors only)
-    aborted = Signal()
-
-    def __init__(
-        self,
-        raw_data,
-        params: dict,
-        sorter_spike_times: dict = None,
-        fs: float = 20000.0,
-        max_workers: int | None = None,
-        native_threads_per_task: int = DEFAULT_NATIVE_THREADS_PER_TASK,
-    ):
-        super().__init__()
-        self.raw_data = raw_data
-        self.params = params if params else dict(DEFAULT_PARAMS)
-        self.sorter_spike_times = sorter_spike_times or {}
-        self.fs = fs
-        self.max_workers = _resolve_worker_count(self.params, max_workers)
-        self.native_threads_per_task = _positive_int(
-            native_threads_per_task,
-            DEFAULT_NATIVE_THREADS_PER_TASK,
-        )
-        
-        self._abort = False
-        self._completed_count = 0
-        self._total_channels = 0
-        self._tasks = []  # <--- CRITICAL: Prevents Python Garbage Collector from killing tasks
-        
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(self.max_workers)
-
-    def abort(self):
-        """Signal the worker to stop and clear pending tasks."""
-        self._abort = True
-        self._pool.clear()
-        self._tasks.clear()  # <--- Ensure tasks are cleared on abort too
-        self.aborted.emit()
-
-    def run(self):
-        """Queue all channels into the thread pool."""
-        try:
-            _, n_channels = self.raw_data.shape
-            self._total_channels = n_channels
-            self._completed_count = 0
-            self._tasks.clear()
-
-            for ch in range(n_channels):
-                if self._abort:
-                    return
-
-                n_sorter = len(self.sorter_spike_times.get(ch, [])) if self.sorter_spike_times else -1
-
-                task = QCChannelTask(
-                    raw_data=self.raw_data,
-                    ch=ch,
-                    n_sorter=n_sorter,
-                    params=self.params,
-                    fs=self.fs,
-                    native_threads=self.native_threads_per_task,
-                )
-                
-                task.signals.result_ready.connect(self._on_task_result)
-                task.signals.error.connect(self._on_task_error)
-                
-                # Keep a Python reference so the Garbage Collector doesn't eat it!
-                self._tasks.append(task)
-                
-                self._pool.start(task)
-
-        except Exception as e:
-            self.error.emit(f"Batch QC initialization failed: {e}")
-
-    def _on_task_result(self, result: QCResult):
-        """Handle successful completion of a single channel."""
-        if self._abort: return
-            
-        self._completed_count += 1
-        self.channel_done.emit(result)
-        
-        self.progress.emit(
-            f"Running QC... ({self._completed_count}/{self._total_channels})",
-            self._completed_count,
-            self._total_channels,
-        )
-        self._check_finished()
-
-    def _on_task_error(self, err_info: dict):
-        """Handle failure of a single channel without crashing the UI."""
-        if self._abort: return
-        
-        ch = err_info["ch"]
-        msg = err_info["msg"]
-        print(f"Skipping CH {ch} due to error:\n{msg}")
-        
-        self._completed_count += 1
-        self.progress.emit(
-            f"Running QC... ({self._completed_count}/{self._total_channels}) [CH {ch} failed]",
-            self._completed_count,
-            self._total_channels,
-        )
-        self._check_finished()
-        
-    def _check_finished(self):
-        """Emit finished signal if all tasks are complete."""
-        if self._completed_count == self._total_channels:
-            # Clean up the task list references to free memory
-            self._tasks.clear()
-            self.finished.emit({"total": self._total_channels})
-
-
 # ── TaskManager (unified dispatch) ──────────────────────────────────────────
 
 class TaskManager(QObject):
@@ -266,12 +142,10 @@ class TaskManager(QObject):
 
     def __init__(
         self,
-        max_workers: int | None = None,
         native_threads_per_task: int = DEFAULT_NATIVE_THREADS_PER_TASK,
         parent: QObject | None = None,
     ):
         super().__init__(parent)
-        self.max_workers = _resolve_worker_count({}, max_workers)
         self.native_threads_per_task = _positive_int(
             native_threads_per_task,
             DEFAULT_NATIVE_THREADS_PER_TASK,
@@ -279,7 +153,7 @@ class TaskManager(QObject):
 
         # ── Internal state ──────────────────────────────────────────────────
         self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(self.max_workers)
+        self._pool.setMaxThreadCount(1)
 
         # CRITICAL: Prevents Python GC from killing in-flight QRunnable tasks.
         self._tasks: list[QCChannelTask] = []
@@ -368,8 +242,7 @@ class TaskManager(QObject):
             sorter_spike_times = sorter_spike_times or {}
             params = params if params else dict(DEFAULT_PARAMS)
             fs = _resolve_fs(params, fs)
-            self.max_workers = _resolve_worker_count(params, None)
-            self._pool.setMaxThreadCount(self.max_workers)
+            self._pool.setMaxThreadCount(1)
 
             _, n_channels = raw_data.shape
             self._batch_total = n_channels
@@ -448,7 +321,7 @@ class TaskManager(QObject):
             self._running_batch = False
             self.batch_finished.emit({"total": self._batch_total})
 
-    # ── Memory cleanup ──────────────────────────────────────────────────────
+# ── Memory cleanup ──────────────────────────────────────────────────────
 
     def _cleanup_task_by_channel(self, ch: int) -> None:
         """
@@ -458,11 +331,10 @@ class TaskManager(QObject):
         remaining = []
         for task in self._tasks:
             if task.ch == ch:
-                pass  # Removed to prevent wrapped C/C++ object deletion crash
+                task.signals.deleteLater()
             else:
                 remaining.append(task)
         self._tasks = remaining
-
 
 # ── LoaderWorker (file I/O + baseline subtraction) ──────────────────────────
 
@@ -472,7 +344,7 @@ class LoaderWorker(QObject):
 
     Pass either:
       - A path to a flat binary file (.dat / .bin)  → memory-mapped (COW)
-      - A path to a Litke .bin *folder*             → materialised ndarray
+      - A path to a Litke .bin *folder* → materialised ndarray
 
     The object emitted by ``finished`` is always a writable (T, C) int16
     array-like with a ``.shape`` attribute, compatible with the rest of the

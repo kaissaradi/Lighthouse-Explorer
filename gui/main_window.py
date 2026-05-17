@@ -198,7 +198,7 @@ class MainWindow(QMainWindow):
         # ── KiloSort state ───────────────────────────────────────────────────
         # sorter_spike_times: {ch: np.ndarray of sample indices}
         #   — all KS spikes on that electrode channel, pooled across units.
-        #   — used by BatchQCWorker for per-channel miss-rate counting.
+        #   — used by TaskManager for per-channel miss-rate counting.
         self.sorter_spike_times: dict = {}
 
         # sorter_unit_map: {unit_id: np.ndarray of sample indices}
@@ -442,7 +442,7 @@ class MainWindow(QMainWindow):
                     self.sorter_dom_channel[int(uid)] = -1
 
             # ── 5. Build per-electrode sorter_spike_times ────────────────────
-            # This is the dict BatchQCWorker uses for miss-rate counting:
+            # This is the dict TaskManager uses for miss-rate counting:
             # {electrode_ch: all spike times of all units whose dom ch == electrode_ch}
             ch_to_times: dict[int, list] = {}
             for uid, times in self.sorter_unit_map.items():

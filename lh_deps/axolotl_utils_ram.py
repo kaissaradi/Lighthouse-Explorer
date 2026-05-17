@@ -6,7 +6,6 @@ Subsampling in baseline computation provides a massive speedup with
 negligible accuracy loss for QC purposes.
 """
 import numpy as np
-import os
 from numba import njit, prange
 
 # ----------------------------------------------------------------------
@@ -149,7 +148,7 @@ def extract_snippets_fast_ram(
     pre, post = window
     L = post - pre + 1
     T, C_raw = raw_data.shape
-    N = spike_times.size
+    spike_times.size
     K = selected_channels.size
 
     # Pre‑filter valid spikes (Numba does not support boolean indexing in prange,
