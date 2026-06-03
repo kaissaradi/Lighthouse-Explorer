@@ -1375,7 +1375,7 @@ def run_qc_pipeline(
     left_times = valley.left_times
     if left_times.size >= 2:
         diffs = np.diff(np.sort(left_times))
-        isi_pairs = np.sum(diffs < 0.010 * fs)  # 10-30 ms in samples
+        isi_pairs = int(np.sum((diffs >= 10) & (diffs <= 30)))
         if isi_pairs > isi_max:
             return _empty_qc_result(ch, n_sorter_spikes, valley, params, reason=f"isi_10_30>{isi_max}")
 

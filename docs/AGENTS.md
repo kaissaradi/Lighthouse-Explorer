@@ -19,13 +19,10 @@ Lighthouse Explorer is a high-speed quality control tool used by researchers to 
 ## 2. The Architecture & Data Pipeline
 
 * **`core/loader.py` & `core/lh_qc_pipeline.py`:** The pure Python science backend. Parses raw files and runs the 4-step pipeline (valley detection → snippet extraction → PCA/KMeans → BL/TR labeling). No Qt code belongs here.
-* **`gui/theme.py`:** Centralised dark stylesheet (`DARK_STYLESHEET`). All CSS lives here — not in `app.py`.
-* **`gui/app.py`:** Purely functional entry point. Creates `QApplication`, applies the stylesheet from `theme.py`, and launches `MainWindow`.
-* **`gui/main_window.py`:** The UI orchestration layer and single source of truth for application state. Delegates all background QC work to `TaskManager`.
-* **`gui/workers/qc_worker.py` → `TaskManager`:** Unified dispatch for both single-channel and batch QC. All tasks run as `QCChannelTask` (`QRunnable`) on a shared `QThreadPool`. There is no separate `QThread` boilerplate for QC — `TaskManager` owns the pool.
-* **`gui/workers/batch_qc_worker.py`:** Contains the `QCChannelTask(QRunnable)` and `QCChannelTaskSignals(QObject)` primitives, plus the legacy `BatchQCWorker` class (still used directly by some tests). `QCChannelTask` is the single unit of work for all QC execution.
-* **`gui/workers/loader_worker.py`:** File I/O worker. This one still uses `QObject` + `QThread` (appropriate for one-shot I/O, not pooled tasks).
-* **`gui/panels/`:** Thin UI layers using `pyqtgraph`. They do no heavy lifting and only react to state changes via Qt Signals.
+* **`run.py`:** The entry point of the application. Initializes `QApplication`, applies visual styles, and launches `MainWindow`.
+* **`gui/main_window.py`:** The UI orchestration layer and single source of truth for application state. Delegates background QC work to `TaskManager`.
+* **`gui/qc_worker.py`:** Contains `LoaderWorker` (File I/O worker using `QObject` + `QThread`) and `TaskManager` (orchestrates background QC tasks run as `QCChannelTask` (`QRunnable`) on a `QThreadPool`). Note: all legacy batch processing methods/signals are deprecated/removed.
+* **`gui/panels.py`:** Consolidates UI visualization panels using `pyqtgraph`. These panels are thin visual layers and only react to state changes via Qt Signals.
 * **`lh_deps/`:** Vendored upstream utilities. **READ-ONLY.** Do not modify these files.
 
 ---
@@ -80,8 +77,9 @@ The main application dependencies are in `requirements.txt`. Test deps are separ
 conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/ -v
 
 # Individual test files
-conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/test_batch_qc_worker.py -v
-conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/test_memory_leaks.py -v
+conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/test_gui_state.py -v
+conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/test_spike_match.py -v
+conda run -n lighthouse_qc env PYTHONPATH=. pytest tests/test_result_types.py -v
 
 # Launch the app (blocks until window is closed; use timeout for smoke-test)
 conda run -n lighthouse_qc env PYTHONPATH=. timeout 5 python run.py
@@ -94,20 +92,19 @@ Tests use `QT_QPA_PLATFORM=offscreen` (set in `tests/conftest.py`) so they run h
 
 ### 3.6 OpenMP/BLAS Concurrency Rule (CRITICAL)
 
-We use Scikit-Learn (PCA/KMeans) inside worker threads. You MUST pin native threads (`OMP_NUM_THREADS="1"`, `OPENBLAS_NUM_THREADS="1"`) at the task level before batch processing to prevent deadlocks and CPU thread explosion. This is enforced by:
+We use Scikit-Learn (PCA/KMeans) inside worker threads. You MUST pin native threads (`OMP_NUM_THREADS="1"`, `OPENBLAS_NUM_THREADS="1"`, etc.) at the task level to prevent deadlocks and CPU thread explosion. This is enforced by:
 
-1. `core/native_threading.py` → `configure_native_thread_environment()` — sets env vars at process startup.
-2. `core/native_threading.py` → `native_thread_limits(1)` — runtime context manager using `threadpoolctl` inside each `QCChannelTask.run()`.
+1. `core/__init__.py` → `configure_native_thread_environment()` — sets environment variables at process startup.
+2. `core/__init__.py` → `native_thread_limits(1)` — runtime context manager using `threadpoolctl` inside each `QCChannelTask.run()`.
 
-Both layers are required. Env vars only affect libraries loaded *after* they're set; `threadpoolctl` handles already-loaded libraries.
+Both layers are required. Environment variables only affect libraries loaded *after* they're set; `threadpoolctl` handles already-loaded libraries.
 
-### 3.7 Garbage Collection (Memory Leaks)
+### 3.7 Garbage Collection (Memory Safety)
 
 When writing `QRunnable` or `QThread` logic:
 
 * You MUST keep a Python reference to active tasks (`self._tasks.append(task)`) to prevent the Python GC from destroying the C++ `QRunnable` while the thread pool is still executing it.
-* You MUST call `.deleteLater()` on `QObject` signal holders upon task completion or abortion.
-* The memory leak regression test (`tests/test_memory_leaks.py`) verifies this. Run it after any worker changes.
+* You MUST call `.deleteLater()` on custom `QObject` signal emitters or workers upon task completion or abortion to ensure proper lifecycle management.
 
 ---
 
