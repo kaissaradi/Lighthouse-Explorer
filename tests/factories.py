@@ -62,7 +62,15 @@ def make_qc_result(
             "uncertain_lowBL": 0,
         },
         times=times,
+        ok=True,
+        bl_keep_times=times[:n_lh].astype(np.int64) if n_lh else np.array([], dtype=np.int64),
+        tr_keep_times=np.array([], dtype=np.int64),
     )
+    final_times = times[:n_lh].astype(np.int64) if n_lh else np.array([], dtype=np.int64)
+    # Minimal EI so Phy export has a template shape
+    final_ei = np.zeros((1, snippet_len), dtype=np.float32)
+    if n_lh > 0:
+        final_ei[0, snippet_len // 3] = -100.0
 
     return QCResult(
         channel=channel,
@@ -71,4 +79,6 @@ def make_qc_result(
         snippets=snippets,
         pca_km=pca_km,
         bltr=bltr,
+        final_times=final_times,
+        final_ei=final_ei,
     )

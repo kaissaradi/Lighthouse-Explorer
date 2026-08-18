@@ -9,7 +9,7 @@ from typing import Optional
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QSpinBox, QDoubleSpinBox,
-    QFileDialog, QRadioButton,
+    QFileDialog, QRadioButton, QCheckBox,
 )
 from qtpy.QtCore import Signal
 
@@ -72,6 +72,8 @@ class LoadPanel(QWidget):
         self._duration_min = QDoubleSpinBox()
         self._duration_min.setRange(0, 10000)
         self._duration_min.setSpecialValueText("Full file")
+        # 0 = load the entire recording (recommended for real analysis).
+        # Use a short duration only for quick UI tests.
         self._duration_min.setValue(0.0)
         self._add_row(rec_layout, "duration (min)", self._duration_min)
 
@@ -87,9 +89,30 @@ class LoadPanel(QWidget):
         self._sorter_load_btn = QPushButton("Load Sorter")
         self._sorter_load_btn.clicked.connect(self._on_sorter_load)
         sorter_layout.addWidget(self._sorter_load_btn)
-        sorter_layout.addWidget(QLabel("(for miss-rate display)"))
+        sorter_layout.addWidget(QLabel("(for miss-rate display; loads in background)"))
         sorter_grp.setLayout(sorter_layout)
         layout.addWidget(sorter_grp)
+
+        # ── Workflow options ───────────────────────────────────────
+        opt_grp = QGroupBox("Workflow")
+        opt_layout = QVBoxLayout()
+        self._auto_batch = QCheckBox("Auto-run batch QC after load")
+        self._auto_batch.setChecked(True)
+        self._auto_batch.setToolTip(
+            "When checked, QC walks every channel after load (1 thread — "
+            "Numba multi-worker is unsafe). Uncheck to only run channels you click."
+        )
+        opt_layout.addWidget(self._auto_batch)
+        hint = QLabel(
+            "Channels are shown 1-based (CH 1 = first electrode). "
+            "Litke TTL channel is stripped. KS can be loaded anytime. "
+            "Baseline stride only speeds DC estimate — full data is kept."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        opt_layout.addWidget(hint)
+        opt_grp.setLayout(opt_layout)
+        layout.addWidget(opt_grp)
 
         # ── LH Params ──────────────────────────────────────────────
         param_grp = QGroupBox("LH Params")
@@ -231,6 +254,7 @@ class LoadPanel(QWidget):
             "support_min_bl_bulk": self._min_bl_bulk.value(),
             "min_trough": self._min_trough.value(),
             "bin_width": self._bin_width.value(),
+            "auto_batch_qc": self._auto_batch.isChecked(),
         }
         return params
 
@@ -238,6 +262,13 @@ class LoadPanel(QWidget):
         """Disable/enable the Load button during I/O."""
         self._load_btn.setEnabled(not loading)
         self._load_btn.setText("Loading…" if loading else "Load Recording")
+
+    def set_sorter_loading_state(self, loading: bool):
+        """Disable sorter controls while background KS parse runs."""
+        self._sorter_load_btn.setEnabled(not loading)
+        self._sorter_load_btn.setText("Loading KS…" if loading else "Load Sorter")
+        self._sorter_btn.setEnabled(not loading)
+        self._sorter_path.setEnabled(not loading)
 
     def set_defaults(self, dat_path: Optional[str], n_channels: Optional[int]):
         """Pre-fill from CLI defaults."""
@@ -291,8 +322,17 @@ class _ChannelListWidget(QListWidget):
                     self.channel_activated.emit(int(ch))
 
 
+def _display_ch(ch: int) -> int:
+    """UI channel number (1-based). Internal storage stays 0-based."""
+    return int(ch) + 1
+
+
 class ArrayMapPanel(QWidget):
-    """Channel selector with groups: All / LH Found / Uncertain / No LH."""
+    """Channel selector with groups: All / LH Found / Uncertain / No LH.
+
+    Internal channel indices are 0-based (raw array columns after Litke TTL
+    strip). Labels and the Go box use 1-based numbers (CH 1 = first electrode).
+    """
 
     channel_selected = Signal(int)
 
@@ -300,7 +340,7 @@ class ArrayMapPanel(QWidget):
         super().__init__(parent)
         self._n_channels: int = 0
         self._selected_ch: Optional[int] = None
-        self._qc_results: dict = {}  # {ch: QCResult}
+        self._qc_results: dict = {}  # {ch: QCResult}  # 0-based keys
         self._build_ui()
 
     def _build_ui(self):
@@ -367,7 +407,7 @@ class ArrayMapPanel(QWidget):
         self._progress_bar.setMaximum(total)
         self._progress_bar.setValue(current)
         self._progress_lbl.setVisible(True)
-        self._progress_lbl.setText(message or f"CH {current}/{total}")
+        self._progress_lbl.setText(message or f"{current}/{total} channels done")
 
     def hide_progress(self):
         self._progress_bar.setVisible(False)
@@ -447,12 +487,16 @@ class ArrayMapPanel(QWidget):
         return True
 
     def _make_label_color(self, ch: int, result):
+        dch = _display_ch(ch)
         if result:
-            label = f"CH {ch} — {result.n_lh} LH, {result.n_soup} soup, {result.n_uncertain} unc"
+            label = (
+                f"CH {dch} — {result.n_lh} LH, {result.n_soup} soup, "
+                f"{result.n_uncertain} unc"
+            )
             lh_ratio = result.n_lh / result.n_total if result.n_total > 0 else 0
             color = QColor(int(255 * (1.0 - lh_ratio)), int(255 * lh_ratio), 40)
         else:
-            label = f"CH {ch} — pending"
+            label = f"CH {dch} — pending"
             color = QColor(136, 136, 136)
         return label, color
 
@@ -512,16 +556,23 @@ class ArrayMapPanel(QWidget):
             self.channel_selected.emit(int(ch))
 
     def _on_go(self):
+        """Go box accepts 1-based channel numbers (CH 1 = first electrode)."""
         text = self._ch_input.text().strip()
         if not text:
             return
         try:
-            ch = int(text)
+            display = int(text)
         except ValueError:
             return
+        # Accept either 1-based (preferred) or 0-based if user types 0
+        if display == 0:
+            ch = 0
+        else:
+            ch = display - 1
         if 0 <= ch < self._n_channels:
             self._view_combo.setCurrentText("All")
             self._select_channel_by_index(ch)
+            self.channel_selected.emit(ch)
             self._ch_input.clear()
 
     def _select_channel_by_index(self, ch: int):
@@ -538,9 +589,16 @@ qc_view_panel.py — Right side: 4 pyqtgraph plots (2×2) + summary stats bar.
 from typing import Optional
 import pyqtgraph as pg
 import numpy as np
-from qtpy.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout
+from qtpy.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout, QComboBox,
+)
 from qtpy.QtCore import Qt
 from core.lh_qc_pipeline import QCResult
+from core.spike_match import (
+    COMPARE_MODES,
+    DEFAULT_COMPARE_MODE,
+    compare_lh_ks,
+)
 
 # Re-export with the keys this module historically used (uppercase "LH")
 COLORS = {
@@ -552,6 +610,19 @@ COLORS = {
     "cluster1": COLORS["cluster1"],
 }
 
+# Human labels for compare-mode combo (value → display)
+_COMPARE_MODE_LABELS = {
+    "per_unit": "Per-unit (default)",
+    "good_only": "Good-only pool",
+    "all_pool": "All units pool",
+}
+_LABEL_COLORS = {
+    "good": "#7CFC98",
+    "mua": "#F0C674",
+    "unsorted": "#A0A4B0",
+    "unknown": "#A0A4B0",
+}
+
 
 class QCViewPanel(QWidget):
     """QC visualization panel with 4 plots and summary bar."""
@@ -559,6 +630,7 @@ class QCViewPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_result: Optional[QCResult] = None
+        self._compare_mode: str = DEFAULT_COMPARE_MODE
         self._build_ui()
 
     def _build_ui(self):
@@ -577,6 +649,26 @@ class QCViewPanel(QWidget):
         self._summary_bar.addStretch()
         layout.addLayout(self._summary_bar)
 
+        # ── LH vs KS compare mode (LH = ground truth) ────────────
+        cmp_row = QHBoxLayout()
+        cmp_lbl = QLabel("KS compare:")
+        cmp_lbl.setStyleSheet("font-size: 11px; color: #A0A4B0;")
+        cmp_row.addWidget(cmp_lbl)
+        self._compare_combo = QComboBox()
+        for mode in COMPARE_MODES:
+            self._compare_combo.addItem(_COMPARE_MODE_LABELS.get(mode, mode), mode)
+        self._compare_combo.setCurrentIndex(0)  # per_unit default
+        self._compare_combo.setToolTip(
+            "How to score the sorter against LH ground truth (final_times).\n"
+            "• Per-unit: match each KS unit; pick primary when one dominates.\n"
+            "• Good-only: pool only Phy 'good' units, then Venn.\n"
+            "• All units: pool every non-noise unit on the channel (legacy)."
+        )
+        self._compare_combo.currentIndexChanged.connect(self._on_compare_mode_changed)
+        cmp_row.addWidget(self._compare_combo)
+        cmp_row.addStretch()
+        layout.addLayout(cmp_row)
+
         # ── 2×2 Plot Grid ────────────────────────────────────────
         grid = QGridLayout()
         grid.setSpacing(4)
@@ -589,9 +681,9 @@ class QCViewPanel(QWidget):
         self._plot_pca.showGrid(x=True, y=True, alpha=0.15)
         self._plot_waveforms.showGrid(x=True, y=True, alpha=0.15)
 
-        # Bottom-left: stacked KS fragmentation bar + FR overlay
+        # Bottom-left: stacked LH↔KS compare + FR over time
         self._fr_layout = pg.GraphicsLayoutWidget()
-        self._plot_fr   = self._fr_layout.addPlot(row=0, col=0)   # KS fragmentation
+        self._plot_fr   = self._fr_layout.addPlot(row=0, col=0)   # LH vs KS
         self._plot_fr_time = self._fr_layout.addPlot(row=1, col=0) # FR over time
         self._fr_layout.ci.layout.setRowStretchFactor(0, 3)
         self._fr_layout.ci.layout.setRowStretchFactor(1, 2)
@@ -621,13 +713,22 @@ class QCViewPanel(QWidget):
         )
         layout.addWidget(self._placeholder)
 
+    def _on_compare_mode_changed(self, _idx: int = 0):
+        mode = self._compare_combo.currentData()
+        if isinstance(mode, str):
+            self._compare_mode = mode
+        if self._current_result is not None:
+            self._update_fr_plot(self._current_result)
+
     def show_result(self, result: QCResult):
         """Main entry point. Update all 4 plots and summary bar."""
         self._current_result = result
         
         # Intercept rejected channels
         if result.reject_reason:
-            self._placeholder.setText(f"Channel {result.channel} Rejected: {result.reject_reason}")
+            self._placeholder.setText(
+                f"Channel {_display_ch(result.channel)} Rejected: {result.reject_reason}"
+            )
             self._placeholder.setStyleSheet("color: #F08080; font-size: 16px; font-weight: bold;")
             self._placeholder.show()
             self._update_summary_bar(result)
@@ -649,8 +750,8 @@ class QCViewPanel(QWidget):
         self._update_waveforms(result)
 
     def show_loading(self, channel: int):
-        """Show 'Running QC on CH X...' placeholder."""
-        self._placeholder.setText(f"Running QC on CH {channel}…")
+        """Show 'Running QC on CH X...' placeholder (channel is 0-based internal)."""
+        self._placeholder.setText(f"Running QC on CH {_display_ch(channel)}…")
         self._placeholder.show()
         self._clear_plots()
 
@@ -685,7 +786,7 @@ class QCViewPanel(QWidget):
 
     def _update_summary_bar(self, result: QCResult):
         fields = [
-            f"CH: {result.channel}",
+            f"CH: {_display_ch(result.channel)}",
             f"Total: {result.n_total}",
             f"LH: {result.n_lh} ({result.n_lh/max(1,result.n_total)*100:.0f}%)",
             f"Soup: {result.n_soup} ({result.n_soup/max(1,result.n_total)*100:.0f}%)",
@@ -701,12 +802,17 @@ class QCViewPanel(QWidget):
         p = self._plot_hist
         p.clear()
 
-        vals = result.valley.all_vals
-        if vals.size == 0:
-            p.setTitle("No crossings")
+        # Prefer precomputed hist (all_vals is deliberately dropped after QC to
+        # save RAM on long recordings — see slim_qc_result / run_qc_pipeline).
+        counts = getattr(result.valley, "amp_hist_counts", None)
+        edges = getattr(result.valley, "amp_hist_edges", None)
+        if counts is None or edges is None or len(counts) == 0 or len(edges) < 2:
+            vals = getattr(result.valley, "all_vals", None)
+            if vals is None or np.asarray(vals).size == 0:
+                p.setTitle("No crossings")
+                return
+            p.setTitle("No histogram")
             return
-
-        counts, edges = result.valley.amp_hist_counts, result.valley.amp_hist_edges
 
         # pyqtgraph with stepMode=True requires len(x) == len(y) + 1
         p.plot(
@@ -727,7 +833,7 @@ class QCViewPanel(QWidget):
             )
             p.addItem(vline)
 
-        p.setTitle(f"Amplitude Histogram (CH {result.channel})")
+        p.setTitle(f"Amplitude Histogram (CH {_display_ch(result.channel)})")
         p.setLabel("bottom", "ADC amplitude")
         p.setLabel("left", "Count")
         
@@ -764,7 +870,7 @@ class QCViewPanel(QWidget):
                     symbolPen=None,
                 )
 
-        p.setTitle(f"PCA: PC1 vs PC2 (CH {result.channel})")
+        p.setTitle(f"PCA: PC1 vs PC2 (CH {_display_ch(result.channel)})")
         p.setLabel(
             "bottom",
             f"PC1 ({evr[0]*100:.0f}%)" if evr.size > 0 else "PC1",
@@ -775,76 +881,207 @@ class QCViewPanel(QWidget):
         )
 
     def _update_fr_plot(self, result):
-        """Venn Diagram replacing KS fragmentation bar chart."""
+        """LH ground truth vs KS — per-unit bars (default) or pooled Venn."""
         p = self._plot_fr
         p.clear()
+        # Reset axes state from previous mode (Venn hides them)
+        p.showAxis("bottom")
+        p.showAxis("left")
+        p.setAspectLocked(False)
+        p.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
 
-        fs = getattr(result, "fs", 20_000)
-        coincidence_samp = int(0.001 * fs)  # ±1 ms window
+        fs = float(getattr(result, "fs", 20_000) or 20_000)
+        coincidence_samp = max(1, int(0.001 * fs))
+        mode = getattr(self, "_compare_mode", DEFAULT_COMPARE_MODE)
 
-        # 1. Gather all LH spikes
-        lh_times = np.array([], dtype=np.int64)
-        if hasattr(result, "valley"):
-            parts = [t for t in [result.valley.left_times, result.valley.rightk_times] if t.size]
-            if parts:
-                lh_times = np.sort(np.concatenate(parts))
+        lh_times = _lh_times_from_result(result)
+        sorter_unit_map = getattr(result, "sorter_unit_map", None) or {}
+        sorter_unit_labels = getattr(result, "sorter_unit_labels", None) or {}
+        st = getattr(result, "sorter_times", None)
+        dch = _display_ch(result.channel)
+        sorter_known = getattr(result, "n_sorter_spikes", -1) >= 0
+        reject = getattr(result, "reject_reason", None)
 
-        # 2. Gather all KS spikes for this channel
-        sorter_unit_map = getattr(result, "sorter_unit_map", {})
-        if sorter_unit_map:
-            all_t = np.concatenate(list(sorter_unit_map.values()))
-            ks_times = np.sort(all_t)
+        # Candidates on rejected channels: still real crossings, not LH GT
+        n_cand = int(_candidate_times_from_result(result).size)
+
+        cmp = compare_lh_ks(
+            lh_times,
+            sorter_unit_map,
+            unit_labels=sorter_unit_labels,
+            pooled_times=st,
+            mode=mode,
+            fs=fs,
+            coincidence_samples=coincidence_samp,
+        )
+
+        if reject:
+            n_ks = cmp.n_ks_total
+            extra = f" | amp candidates: {n_cand}" if n_cand else ""
+            if cmp.unit_stats:
+                # Show KS unit sizes only (no LH GT). Bar width = unit n spikes.
+                for s in cmp.unit_stats:
+                    s.n_matched = s.n_unit  # reuse bar field for display
+                self._draw_unit_bars(
+                    p, cmp, n_lh=0, dch=dch,
+                    title_suffix=f"(REJECTED {reject}{extra})",
+                )
+            else:
+                p.setTitle(
+                    f"LH vs KS — CH {dch} REJECTED ({reject}) | KS on ch: {n_ks}"
+                    f"{extra} (candidates ≠ LH ground truth)"
+                )
+            return
+
+        if cmp.n_ks_total == 0 and not sorter_unit_map:
+            if sorter_known:
+                p.setTitle(f"LH vs KS — CH {dch} (no KS spikes on this ch / window)")
+            else:
+                p.setTitle(f"LH vs KS — CH {dch} (load KS sorter)")
+            return
+        if cmp.n_lh == 0:
+            p.setTitle(f"LH vs KS — CH {dch} (no accepted LH / final_times)")
+            return
+
+        win_ms = coincidence_samp * 1000.0 / fs
+        if mode == "per_unit" and cmp.unit_stats:
+            self._draw_unit_bars(p, cmp, n_lh=cmp.n_lh, dch=dch, win_ms=win_ms)
         else:
-            ks_times = np.array([], dtype=np.int64)
+            self._draw_venn(p, cmp, dch=dch, win_ms=win_ms)
 
-        if not sorter_unit_map:
-            p.setTitle(f"LH vs KS Venn Diagram — CH {result.channel} (no sorter)")
-            return
-        if lh_times.size == 0:
-            p.setTitle(f"LH vs KS Venn Diagram — CH {result.channel} (no LH spikes)")
-            return
-
-        # 3. Fast two-pointer matching (shared utility)
-        from core.loader import match_spikes
-        matched, lh_only, ks_only, _ = match_spikes(lh_times, ks_times, coincidence_samp)
-
-        # 4. Draw the Venn Diagram 
+    def _draw_venn(self, p, cmp, *, dch: int, win_ms: float = 1.0):
+        """Pooled Venn: LH-only / matched / KS-only."""
         theta = np.linspace(0, 2 * np.pi, 100)
         r = 1.0
-        
-        # Circle boundaries
         x_lh = -0.5 + r * np.cos(theta)
         y_lh = r * np.sin(theta)
-        
         x_ks = 0.5 + r * np.cos(theta)
         y_ks = r * np.sin(theta)
-        
-        # Add outlines
-        p.addItem(pg.PlotCurveItem(x_lh, y_lh, pen=pg.mkPen(COLORS["LH"], width=2))) # Green LH
-        p.addItem(pg.PlotCurveItem(x_ks, y_ks, pen=pg.mkPen(COLORS["cluster0"], width=2))) # Blue KS
-        
-        # Add Text Labels
-        text_lh = pg.TextItem(f"LH Only\n{lh_only}", color=COLORS["LH"], anchor=(0.5, 0.5))
+
+        p.addItem(pg.PlotCurveItem(x_lh, y_lh, pen=pg.mkPen(COLORS["LH"], width=2)))
+        p.addItem(pg.PlotCurveItem(x_ks, y_ks, pen=pg.mkPen(COLORS["cluster0"], width=2)))
+
+        text_lh = pg.TextItem(
+            f"LH Only\n{cmp.n_lh_only}", color=COLORS["LH"], anchor=(0.5, 0.5)
+        )
         text_lh.setPos(-0.9, 0)
         p.addItem(text_lh)
-        
-        text_both = pg.TextItem(f"Matched\n{matched}", color="#FFFFFF", anchor=(0.5, 0.5))
+
+        text_both = pg.TextItem(
+            f"Matched\n{cmp.n_matched}", color="#FFFFFF", anchor=(0.5, 0.5)
+        )
         text_both.setPos(0, 0)
         p.addItem(text_both)
-        
-        text_ks = pg.TextItem(f"KS Only\n{ks_only}", color=COLORS["cluster0"], anchor=(0.5, 0.5))
+
+        text_ks = pg.TextItem(
+            f"KS Only\n{cmp.n_ks_only}", color=COLORS["cluster0"], anchor=(0.5, 0.5)
+        )
         text_ks.setPos(0.9, 0)
         p.addItem(text_ks)
 
-        # 5. Clean up plot aesthetics
-        p.hideAxis('bottom')
-        p.hideAxis('left')
-        p.setAspectLocked(True) # Keep circles round
+        p.hideAxis("bottom")
+        p.hideAxis("left")
+        p.setAspectLocked(True)
         p.setXRange(-2, 2, padding=0)
         p.setYRange(-1.5, 1.5, padding=0)
-        
-        win_ms = coincidence_samp * 1000 / fs
-        p.setTitle(f"LH vs KS Venn Diagram — CH {result.channel} (±{win_ms:.0f} ms)")
+
+        mode_tag = {
+            "good_only": "good pool",
+            "all_pool": "all pool",
+            "per_unit": "pool",
+        }.get(cmp.mode, cmp.mode)
+        note = f" | {cmp.note}" if cmp.note else ""
+        p.setTitle(
+            f"LH vs KS Venn ({mode_tag}) — CH {dch}  "
+            f"recall={cmp.recall:.0%}  ±{win_ms:.0f} ms{note}"
+        )
+
+    def _draw_unit_bars(self, p, cmp, *, n_lh: int, dch: int, win_ms: float = 1.0,
+                        title_suffix: str = ""):
+        """Horizontal bars: matched LH spikes per KS unit (+ LH-only row)."""
+        stats = list(cmp.unit_stats)
+        # Cap visual clutter: top units by matched, then by size
+        max_bars = 12
+        if len(stats) > max_bars:
+            stats = stats[:max_bars]
+
+        labels = []
+        matched_vals = []
+        brushes = []
+        for s in stats:
+            tag = "★" if (cmp.primary_unit_id == s.unit_id and cmp.confident) else ""
+            labels.append(f"U{s.unit_id} {s.label}{tag}")
+            matched_vals.append(float(s.n_matched))
+            brushes.append(pg.mkBrush(_LABEL_COLORS.get(s.label, "#A0A4B0")))
+
+        if n_lh > 0:
+            labels.append("LH-only")
+            matched_vals.append(float(cmp.n_lh_only))
+            brushes.append(pg.mkBrush(COLORS["LH"]))
+
+        if not labels:
+            p.setTitle(f"LH vs KS per-unit — CH {dch} (no units)")
+            return
+
+        y = np.arange(len(labels), dtype=np.float64)
+        # Draw top unit at top of plot
+        y_plot = y[::-1]
+        matched_rev = matched_vals[::-1]
+        brushes_rev = brushes[::-1]
+        labels_rev = labels[::-1]
+
+        pen = pg.mkPen("#1a1b1e")
+        bar = pg.BarGraphItem(
+            x0=0,
+            y=y_plot,
+            height=0.7,
+            width=matched_rev,
+            brushes=brushes_rev,
+            pens=[pen] * len(matched_rev),
+        )
+        p.addItem(bar)
+
+        # Annotate counts on bars
+        for yi, val, lab in zip(y_plot, matched_rev, labels_rev):
+            if val <= 0:
+                continue
+            # Find unit stats for extra context
+            extra = ""
+            if lab.startswith("U"):
+                # parse unit id
+                try:
+                    uid = int(lab.split()[0][1:])
+                    st = next((s for s in stats if s.unit_id == uid), None)
+                    if st is not None and n_lh > 0:
+                        extra = f"  ({st.recall:.0%} LH, n={st.n_unit})"
+                    elif st is not None:
+                        extra = f"  (n={st.n_unit})"
+                except (ValueError, IndexError):
+                    pass
+            txt = pg.TextItem(
+                f"{int(val)}{extra}",
+                color="#E8E8EC",
+                anchor=(0, 0.5),
+            )
+            txt.setPos(float(val) + max(matched_vals) * 0.01 + 0.5, float(yi))
+            p.addItem(txt)
+
+        ax = p.getAxis("left")
+        ax.setTicks([[(float(yi), lab) for yi, lab in zip(y_plot, labels_rev)]])
+        p.setLabel("bottom", "Matched LH spikes" if n_lh > 0 else "KS spikes (no LH GT)")
+        p.setLabel("left", "")
+        p.setXRange(0, max(matched_vals) * 1.35 + 1, padding=0)
+        p.setYRange(-0.8, len(labels) - 0.2, padding=0)
+
+        conf = "confident" if cmp.confident else "split/weak"
+        note = cmp.note or ""
+        suffix = f" {title_suffix}" if title_suffix else ""
+        p.setTitle(
+            f"LH vs KS per-unit — CH {dch}  "
+            f"LH={n_lh} matched_any={cmp.n_matched} ({cmp.recall:.0%})  "
+            f"[{conf}] ±{win_ms:.0f} ms{suffix}"
+            + (f"\n{note}" if note else "")
+        )
 
     def _update_fr_time_plot(self, result):
         """FR over time: LH (green) vs KS sorter (blue) — bottom sub-panel."""
@@ -854,13 +1091,11 @@ class QCViewPanel(QWidget):
 
         fs = getattr(result, "fs", 20_000)
         bin_s = 1.0
-        lh_times = np.array([], dtype=np.int64)
-        if hasattr(result, "valley"):
-            parts = [t for t in [result.valley.left_times, result.valley.rightk_times] if t.size]
-            if parts:
-                lh_times = np.sort(np.concatenate(parts))
+        lh_times = _lh_times_from_result(result)
 
         sorter_times = getattr(result, "sorter_times", None)
+        if sorter_times is not None:
+            sorter_times = np.asarray(sorter_times, dtype=np.int64)
 
         all_times = lh_times.copy()
         if sorter_times is not None and sorter_times.size:
@@ -882,7 +1117,8 @@ class QCViewPanel(QWidget):
                    pen=pg.mkPen(COLORS["cluster0"], width=1.2), name="KS")
 
         has_ks = sorter_times is not None and sorter_times.size > 0
-        p.setTitle(f"FR over time — CH {result.channel}" + ("" if has_ks else " (no KS)"))
+        dch = _display_ch(result.channel)
+        p.setTitle(f"FR over time — CH {dch}" + ("" if has_ks else " (no KS on ch)"))
         p.setLabel("bottom", "Time (s)")
         p.setLabel("left", "Spikes/s")
 
@@ -908,7 +1144,7 @@ class QCViewPanel(QWidget):
                 name=label,
             )
 
-        p.setTitle(f"Mean Waveforms on CH {result.channel}")
+        p.setTitle(f"Mean Waveforms on CH {_display_ch(result.channel)}")
         p.setLabel("bottom", "Samples")
         p.setLabel("left", "ADC amplitude")
         p.addLegend(offset=(10, 10))
@@ -930,6 +1166,35 @@ from qtpy.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
 )
 from qtpy.QtCore import Qt
+
+
+def _lh_times_from_result(result) -> np.ndarray:
+    """Clean LH spike times used as ground truth for sorter comparison / FR.
+
+    Only ``final_times`` (BL/TR-filtered, accepted channels) count as LH ground
+    truth. Rejected channels may still have valley ``left_times`` (amplitude
+    candidates) — those are **not** LH and must not be drawn as such (that made
+    valley_count>max channels show fake Matched/LH-only Venns).
+    """
+    if getattr(result, "reject_reason", None):
+        return np.array([], dtype=np.int64)
+    ft = getattr(result, "final_times", None)
+    if ft is not None and np.asarray(ft).size > 0:
+        return np.sort(np.asarray(ft, dtype=np.int64))
+    # Legacy accepted results without final_times: left-side candidates only
+    # (pre-BL/TR). Prefer empty over inventing ground truth.
+    return np.array([], dtype=np.int64)
+
+
+def _candidate_times_from_result(result) -> np.ndarray:
+    """Amplitude 'left' candidates from valley (not necessarily accepted LH)."""
+    valley = getattr(result, "valley", None)
+    if valley is None:
+        return np.array([], dtype=np.int64)
+    lt = getattr(valley, "left_times", None)
+    if lt is None or np.asarray(lt).size == 0:
+        return np.array([], dtype=np.int64)
+    return np.sort(np.asarray(lt, dtype=np.int64))
 
 
 def _fragmentation_index(sorter_unit_map: dict, lh_times: np.ndarray, fs: float) -> dict:
@@ -1032,9 +1297,7 @@ class QCSummaryDialog(QDialog):
 
         for ch in channels_ordered:
             r = results[ch]
-            lh_times = np.sort(np.concatenate([
-                t for t in [r.valley.left_times, r.valley.rightk_times] if t.size
-            ])) if (r.valley.left_times.size + r.valley.rightk_times.size) else np.array([], dtype=np.int64)
+            lh_times = _lh_times_from_result(r)
 
             lh_counts.append(lh_times.size)
             ks_counts.append(r.n_sorter_spikes if r.n_sorter_spikes >= 0 else 0)

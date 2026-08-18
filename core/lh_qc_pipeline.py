@@ -107,12 +107,23 @@ class PCAKMeansResult:
 
 @dataclass
 class BLTRResult:
-    """Output of BL/TR support labeling step."""
-    labels: np.ndarray          # object dtype ['LH','soup','uncertain_boundary','uncertain_lowBL']
-    bl_bulk: np.ndarray         # float32 [N]
-    tr_bulk: np.ndarray         # float32 [N]
+    """Output of BL/TR support labeling step.
+
+    Probe-level labels/times are stored for diagnostics. Keep/reject arrays
+    follow the notebook convention and are used to build ``QCResult.final_times``.
+    """
+    labels: np.ndarray          # object dtype — probe labels (BL then TR)
+    bl_bulk: np.ndarray         # float32 [N_probe]
+    tr_bulk: np.ndarray         # float32 [N_probe]
     counts: dict                # {'LH': int, 'soup': int, 'uncertain_boundary': int, ...}
-    times: np.ndarray           # int64 [N] — same indexing as labels
+    times: np.ndarray           # int64 [N_probe] — same indexing as labels
+    ok: bool = False            # True when probe BL/TR labeling succeeded
+    bl_keep_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    bl_uncertain_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    bl_reject_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    tr_keep_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    tr_uncertain_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    tr_reject_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
 
 @dataclass
@@ -127,6 +138,11 @@ class QCResult:
     reject_reason: Optional[str] = None         # set on early pipeline rejection
     sorter_times: Optional[np.ndarray] = None   # spike times from sorter, attached by main_window
     fs: float = 20_000.0                        # sampling rate, set by main_window
+
+    # Clean LH spike times after BL/TR filtering (empty if rejected).
+    final_times: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
+    # Mean EI over final_times [n_channels, n_samples]; used for Phy/KS templates.
+    final_ei: Optional[np.ndarray] = None
 
     # ── KMeans verdict info ──────────────────────────────────────────────────
     # Populated by run_pca_kmeans_on_left_spikes. Keys:
@@ -150,29 +166,58 @@ class QCResult:
     # ── Convenience properties ───────────────────────────────────────────────
 
     @property
-    def n_total(self) -> int:
-        return int(self.bltr.labels.size)
-
-    @property
     def n_lh(self) -> int:
-        return int(self.bltr.counts.get('LH', 0))
+        """Number of clean LH spikes. Prefers filtered final_times when present."""
+        if self.reject_reason is None and self.final_times.size > 0:
+            return int(self.final_times.size)
+        return int(self.bltr.counts.get("LH", 0))
 
     @property
     def n_soup(self) -> int:
-        return int(self.bltr.counts.get('soup', 0))
+        return int(self.bltr.counts.get("soup", 0))
 
     @property
     def n_uncertain(self) -> int:
         counts = self.bltr.counts
-        return int(counts.get('uncertain_boundary', 0) + counts.get('uncertain_lowBL', 0))
+        return int(counts.get("uncertain_boundary", 0) + counts.get("uncertain_lowBL", 0))
+
+    @property
+    def n_total(self) -> int:
+        """Total spikes accounted for in QC display (LH + soup + uncertain).
+
+        Always derived from the category properties so UI percentages stay
+        consistent. ``n_lh`` prefers filtered ``final_times`` when present.
+        """
+        return int(self.n_lh + self.n_soup + self.n_uncertain)
 
     @property
     def miss_rate(self) -> Optional[float]:
-        """Fraction of LH-labeled spikes NOT found by sorter. None if n_sorter_spikes unknown."""
+        """Fraction of LH spikes not found by sorter.
+
+        When both ``final_times`` and ``sorter_times`` are available, uses
+        coincidence matching (±1 ms). Otherwise falls back to a count ratio.
+        """
         if self.n_sorter_spikes < 0:
             return None
         if self.n_lh == 0:
             return 0.0
+        if (
+            self.final_times.size > 0
+            and self.sorter_times is not None
+            and np.asarray(self.sorter_times).size > 0
+        ):
+            try:
+                from core.loader import match_spikes
+            except ImportError:
+                from loader import match_spikes  # type: ignore
+            fs = float(self.fs) if self.fs else 20_000.0
+            coincidence = max(1, int(0.001 * fs))
+            _n_matched, n_lh_only, _, _ = match_spikes(
+                np.sort(np.asarray(self.final_times, dtype=np.int64)),
+                np.sort(np.asarray(self.sorter_times, dtype=np.int64)),
+                coincidence,
+            )
+            return float(n_lh_only / max(1, self.n_lh))
         missed = max(0, self.n_lh - self.n_sorter_spikes)
         return missed / self.n_lh
 
@@ -182,16 +227,17 @@ class QCResult:
         if self.n_sorter_spikes < 0 or self.n_lh == 0:
             return None
         return self.n_sorter_spikes / self.n_lh
+
+
 from typing import Optional, Tuple
 import numpy as np
 
 # ── Imports from notebook helpers ───────────────────────────────────────────
 try:
     from lh_deps.lighthouse_utils import find_valley_and_times
-    
 except ImportError:
-    from lighthouse_utils import find_valley_and_times
-    
+    from lighthouse_utils import find_valley_and_times  # type: ignore
+
 
 
 
@@ -896,6 +942,11 @@ DEFAULT_PARAMS = dict(
 
     # Final acceptance
     min_final_spikes=200,
+
+    # Mean EI for templates — keep small; chunked accumulation (see compute_mean_ei).
+    # NEVER reuse n_left_spikes_for_pca here (5000 × C × L floats OOMs full-file runs).
+    n_spikes_for_mean_ei=300,
+    mean_ei_batch_size=64,
 )
 
 
@@ -1117,6 +1168,122 @@ def run_pca_kmeans_on_left_spikes(
     return pca_result, km_info
 
 
+def _empty_bltr_counts() -> dict:
+    return {"LH": 0, "soup": 0, "uncertain_boundary": 0, "uncertain_lowBL": 0}
+
+
+def _empty_bltr_result() -> BLTRResult:
+    return BLTRResult(
+        labels=np.array([], dtype=object),
+        bl_bulk=np.array([], dtype=np.float32),
+        tr_bulk=np.array([], dtype=np.float32),
+        counts=_empty_bltr_counts(),
+        times=np.array([], dtype=np.int64),
+        ok=False,
+    )
+
+
+def build_bl_tr_probe_times(
+    raw_data: np.ndarray,
+    left_times: np.ndarray,
+    tr_candidate_times: np.ndarray,
+    *,
+    main_ch: int,
+    win: tuple,
+    n_per_side: int = 2000,
+) -> dict:
+    """Pick BL/TR probe spikes by amplitude (notebook ``build_bl_tr_probe_times``).
+
+    BL probes  = weakest (smallest abs amp) left spikes.
+    TL probes  = strongest left spikes (returned for completeness).
+    TR probes  = strongest right-of-valley candidates.
+    """
+    left_times = np.sort(np.unique(np.asarray(left_times, dtype=np.int64)))
+    tr_candidate_times = np.sort(
+        np.unique(np.asarray(tr_candidate_times, dtype=np.int64))
+    )
+
+    if left_times.size == 0:
+        return dict(ok=False, reason="no_left_times")
+
+    sn_left, left_valid = extract_snippets_fast_ram(
+        raw_data,
+        left_times,
+        window=win,
+        selected_channels=np.asarray([int(main_ch)], dtype=np.int32),
+    )
+    left_valid = np.asarray(left_valid, dtype=np.int64)
+    if sn_left.shape[2] == 0:
+        return dict(ok=False, reason="no_valid_left_snips")
+
+    amp_left = np.max(np.abs(sn_left[0, :, :]), axis=0).astype(np.float32)
+    order_left = np.argsort(amp_left)  # weakest first
+    n_left_pick = int(min(int(n_per_side), order_left.size))
+    bl_times = left_valid[order_left[:n_left_pick]].astype(np.int64)
+    tl_times = left_valid[order_left[-n_left_pick:]].astype(np.int64)
+
+    if tr_candidate_times.size == 0:
+        return dict(
+            ok=True,
+            bl_times=bl_times,
+            tl_times=tl_times,
+            tr_times=np.asarray([], dtype=np.int64),
+        )
+
+    sn_right, right_valid = extract_snippets_fast_ram(
+        raw_data,
+        tr_candidate_times,
+        window=win,
+        selected_channels=np.asarray([int(main_ch)], dtype=np.int32),
+    )
+    right_valid = np.asarray(right_valid, dtype=np.int64)
+    if sn_right.shape[2] == 0:
+        tr_times = np.asarray([], dtype=np.int64)
+    else:
+        amp_right = np.max(np.abs(sn_right[0, :, :]), axis=0).astype(np.float32)
+        order_right = np.argsort(amp_right)[::-1]  # strongest first
+        n_right_pick = int(min(int(n_per_side), order_right.size))
+        tr_times = right_valid[order_right[:n_right_pick]].astype(np.int64)
+
+    return dict(ok=True, bl_times=bl_times, tl_times=tl_times, tr_times=tr_times)
+
+
+def build_final_times_from_bltr(
+    left_times: np.ndarray,
+    rightk_times: np.ndarray,
+    bltr: BLTRResult,
+) -> np.ndarray:
+    """Notebook final-spike rule: drop BL reject/uncertain probes; keep TR LH only.
+
+    If BL/TR support did not succeed (``bltr.ok`` is False), fall back to the
+    unfiltered union of left + rightk candidates (same as notebook when the
+    support filter is off or fails).
+    """
+    left_times = np.sort(np.unique(np.asarray(left_times, dtype=np.int64)))
+    rightk_times = np.sort(np.unique(np.asarray(rightk_times, dtype=np.int64)))
+
+    if not bltr.ok:
+        if left_times.size == 0 and rightk_times.size == 0:
+            return np.array([], dtype=np.int64)
+        parts = [t for t in (left_times, rightk_times) if t.size]
+        return np.sort(np.unique(np.concatenate(parts))) if parts else np.array([], dtype=np.int64)
+
+    bl_reject = np.asarray(bltr.bl_reject_times, dtype=np.int64)
+    bl_uncertain = np.asarray(bltr.bl_uncertain_times, dtype=np.int64)
+    if bl_reject.size or bl_uncertain.size:
+        bl_drop = np.sort(np.unique(np.concatenate([bl_reject, bl_uncertain])))
+    else:
+        bl_drop = np.asarray([], dtype=np.int64)
+
+    clean_left = np.setdiff1d(left_times, bl_drop, assume_unique=False)
+    clean_right = np.sort(np.unique(np.asarray(bltr.tr_keep_times, dtype=np.int64)))
+
+    parts = [t for t in (clean_left, clean_right) if t.size]
+    if not parts:
+        return np.array([], dtype=np.int64)
+    return np.sort(np.unique(np.concatenate(parts)))
+
+
 def run_bltr_support(
     raw_data: np.ndarray,
     valley: ValleyResult,
@@ -1124,24 +1291,23 @@ def run_bltr_support(
     params: dict,
 ) -> BLTRResult:
     """
-    Step 3: Full BL/TR support labeling using notebook's algorithm.
-    Labels ALL left_times (BL group) and ALL rightk_times (TR group) —
-    not just probe subsets — so counts reflect the full spike population.
-    Returns BLTRResult with accurate per-spike counts.
+    Step 3: BL/TR support labeling matching the notebook.
+
+    1. Adaptive snippet window from left spikes.
+    2. Amplitude-ranked probe selection (weakest BL, strongest TR).
+    3. Cosine-support labeling on probe snippets only.
+    4. Return keep/reject/uncertain time arrays for final_times filtering.
     """
-    left_times = valley.left_times
-    rightk_times = getattr(valley, "rightk_times", np.array([], dtype=np.int64))
+    left_times = np.asarray(valley.left_times, dtype=np.int64)
+    rightk_times = np.asarray(
+        getattr(valley, "rightk_times", np.array([], dtype=np.int64)),
+        dtype=np.int64,
+    )
 
     if left_times.size < 2 or rightk_times.size < 2:
-        return BLTRResult(
-            labels=np.array([], dtype=object),
-            bl_bulk=np.array([], dtype=np.float32),
-            tr_bulk=np.array([], dtype=np.float32),
-            counts={"LH": 0, "soup": 0, "uncertain_boundary": 0, "uncertain_lowBL": 0},
-            times=np.array([], dtype=np.int64),
-        )
+        return _empty_bltr_result()
 
-    # Adaptive window — determines the snippet window for ALL spikes
+    # Adaptive window
     km_win, _ = choose_adaptive_km_window(
         raw_data, left_times,
         probe_n=params.get("km_probe_n", 500),
@@ -1156,40 +1322,34 @@ def run_bltr_support(
         rng=np.random.RandomState(params.get("random_state", 42)),
     )
 
-    # ── Determine top channels for support labeling ─────────────────────
+    n_per_side = int(params.get("support_n_probe_per_side", 2000))
+    probe = build_bl_tr_probe_times(
+        raw_data,
+        left_times,
+        rightk_times,
+        main_ch=int(detect_ch),
+        win=km_win,
+        n_per_side=n_per_side,
+    )
+    if not probe.get("ok", False):
+        return _empty_bltr_result()
+
+    bl_times = np.asarray(probe["bl_times"], dtype=np.int64)
+    tr_times = np.asarray(probe["tr_times"], dtype=np.int64)
+    if bl_times.size < 2 or tr_times.size < 2:
+        return _empty_bltr_result()
+
+    # Top channels for support labeling (RMS on a small left sample)
     n_top = int(params.get("support_top_channels", 12))
-    sample_times = left_times[:min(100, len(left_times))]
+    sample_times = left_times[: min(100, len(left_times))]
     sn_sample, _ = extract_snippets_fast_ram(
         raw_data, sample_times, window=km_win,
-        selected_channels=np.arange(raw_data.shape[1], dtype=np.int32)
+        selected_channels=np.arange(raw_data.shape[1], dtype=np.int32),
     )
-    rms = np.sqrt(np.mean(sn_sample**2, axis=(1, 2)))
+    rms = np.sqrt(np.mean(sn_sample ** 2, axis=(1, 2)))
     top_ch = np.argsort(rms)[-n_top:][::-1].astype(np.int32)
     if top_ch.size == 0:
         top_ch = np.arange(raw_data.shape[1], dtype=np.int32)[:n_top]
-
-    # ── Extract snippets for ALL BL (left) and ALL TR (rightk) spikes ───
-    # The BL/TR decision algorithm is O(N² * D): each spike does a full
-    # cosine-similarity pass over every other spike.  To prevent the QC
-    # from hanging on high-firing-rate channels, cap each side at a
-    # representative random subsample and scale the counts back.
-    MAX_BLTR = 3_000
-    subsample_bl = left_times.size > MAX_BLTR
-    subsample_tr = rightk_times.size > MAX_BLTR
-
-    if subsample_bl:
-        rng = np.random.RandomState(params.get("random_state", 42))
-        idx_bl = rng.choice(left_times.size, MAX_BLTR, replace=False)
-        bl_times = left_times[np.sort(idx_bl)]
-    else:
-        bl_times = left_times
-
-    if subsample_tr:
-        rng = np.random.RandomState(params.get("random_state", 42) + 1)
-        idx_tr = rng.choice(rightk_times.size, MAX_BLTR, replace=False)
-        tr_times = rightk_times[np.sort(idx_tr)]
-    else:
-        tr_times = rightk_times
 
     sn_bl, bl_valid = extract_snippets_fast_ram(
         raw_data, bl_times, window=km_win, selected_channels=top_ch
@@ -1197,60 +1357,218 @@ def run_bltr_support(
     sn_tr, tr_valid = extract_snippets_fast_ram(
         raw_data, tr_times, window=km_win, selected_channels=top_ch
     )
+    bl_valid = np.asarray(bl_valid, dtype=np.int64)
+    tr_valid = np.asarray(tr_valid, dtype=np.int64)
 
     if sn_bl.shape[2] < 2 or sn_tr.shape[2] < 2:
-        return BLTRResult(
-            labels=np.array([], dtype=object),
-            bl_bulk=np.array([], dtype=np.float32),
-            tr_bulk=np.array([], dtype=np.float32),
-            counts={"LH": 0, "soup": 0, "uncertain_boundary": 0, "uncertain_lowBL": 0},
-            times=np.array([], dtype=np.int64),
-        )
+        return _empty_bltr_result()
 
-    # ── Run BL/TR decision on the (possibly subsampled) groups ──────────
-    decision = compute_bl_tr_support_decisions_from_groups(
-        sn_bl,
-        sn_tr,
-        cos_mask_adc=params.get("support_cos_mask_adc", 30.0),
-        k_peak=params.get("support_k_peak", (5, 10, 20)),
-        k_bulk=params.get("support_k_bulk", (50, 100, 200)),
-        min_bl_bulk=params.get("support_min_bl_bulk", 0.70),
-        diag_eps=params.get("support_diag_eps", 0.05),
+    try:
+        decision = compute_bl_tr_support_decisions_from_groups(
+            sn_bl,
+            sn_tr,
+            cos_mask_adc=params.get("support_cos_mask_adc", 30.0),
+            k_peak=params.get("support_k_peak", (5, 10, 20)),
+            k_bulk=params.get("support_k_bulk", (50, 100, 200)),
+            min_bl_bulk=params.get("support_min_bl_bulk", 0.70),
+            diag_eps=params.get("support_diag_eps", 0.05),
+        )
+    except ValueError:
+        return _empty_bltr_result()
+
+    bl_labels = np.asarray(decision["bl_labels"], dtype=object)
+    tr_labels = np.asarray(decision["tr_labels"], dtype=object)
+
+    # Align labels to valid extraction times (same length as decision arrays)
+    if bl_labels.size != bl_valid.size:
+        bl_valid = bl_valid[: bl_labels.size]
+    if tr_labels.size != tr_valid.size:
+        tr_valid = tr_valid[: tr_labels.size]
+
+    bl_keep_mask = bl_labels == "LH"
+    bl_uncertain_mask = np.isin(
+        bl_labels, np.asarray(["uncertain_boundary", "uncertain_lowBL"], dtype=object)
     )
+    tr_keep_mask = tr_labels == "LH"
+    tr_uncertain_mask = np.isin(
+        tr_labels, np.asarray(["uncertain_boundary", "uncertain_lowBL"], dtype=object)
+    )
+    bl_reject_mask = ~(bl_keep_mask | bl_uncertain_mask)
+    tr_reject_mask = ~(tr_keep_mask | tr_uncertain_mask)
+
+    bl_bulk = np.array(
+        [float(m.get("BL_bulk", np.nan)) for m in decision["bl_metrics"]],
+        dtype=np.float32,
+    )
+    tr_bulk_bl = np.array(
+        [float(m.get("TR_bulk", np.nan)) for m in decision["bl_metrics"]],
+        dtype=np.float32,
+    )
+    bl_bulk_tr = np.array(
+        [float(m.get("BL_bulk", np.nan)) for m in decision["tr_metrics"]],
+        dtype=np.float32,
+    )
+    tr_bulk = np.array(
+        [float(m.get("TR_bulk", np.nan)) for m in decision["tr_metrics"]],
+        dtype=np.float32,
+    )
+
+    labels = np.concatenate([bl_labels, tr_labels])
+    times = np.concatenate([bl_valid, tr_valid]).astype(np.int64)
+    bulk_bl = np.concatenate([bl_bulk, bl_bulk_tr]).astype(np.float32)
+    bulk_tr = np.concatenate([tr_bulk_bl, tr_bulk]).astype(np.float32)
 
     blc = decision["bl_counts"]
     trc = decision["tr_counts"]
-
-    # ── Scale counts back to full population if we subsampled ───────────
-    # Each labeled spike in the subsample represents a fraction of the
-    # full population.  We round to nearest integer.
-    if subsample_bl:
-        scale_bl = left_times.size / MAX_BLTR
-    else:
-        scale_bl = 1.0
-
-    if subsample_tr:
-        scale_tr = rightk_times.size / MAX_BLTR
-    else:
-        scale_tr = 1.0
-
-    total_lh = int(round(blc["LH"] * scale_bl + trc["LH"] * scale_tr))
-    total_soup = int(round(blc["soup"] * scale_bl + trc["soup"] * scale_tr))
-    total_unc_bnd = int(round(blc["uncertain_boundary"] * scale_bl + trc["uncertain_boundary"] * scale_tr))
-    total_unc_low = int(round(blc["uncertain_lowBL"] * scale_bl + trc["uncertain_lowBL"] * scale_tr))
+    counts = {
+        "LH": int(blc["LH"] + trc["LH"]),
+        "soup": int(blc["soup"] + trc["soup"]),
+        "uncertain_boundary": int(blc["uncertain_boundary"] + trc["uncertain_boundary"]),
+        "uncertain_lowBL": int(blc["uncertain_lowBL"] + trc["uncertain_lowBL"]),
+    }
 
     return BLTRResult(
-        labels=np.array([], dtype=object),
-        bl_bulk=np.array([], dtype=np.float32),
-        tr_bulk=np.array([], dtype=np.float32),
-        counts={
-            "LH": total_lh,
-            "soup": total_soup,
-            "uncertain_boundary": total_unc_bnd,
-            "uncertain_lowBL": total_unc_low,
-        },
-        times=np.array([], dtype=np.int64),
+        labels=labels,
+        bl_bulk=bulk_bl,
+        tr_bulk=bulk_tr,
+        counts=counts,
+        times=times,
+        ok=True,
+        bl_keep_times=np.asarray(bl_valid[bl_keep_mask], dtype=np.int64),
+        bl_uncertain_times=np.asarray(bl_valid[bl_uncertain_mask], dtype=np.int64),
+        bl_reject_times=np.asarray(bl_valid[bl_reject_mask], dtype=np.int64),
+        tr_keep_times=np.asarray(tr_valid[tr_keep_mask], dtype=np.int64),
+        tr_uncertain_times=np.asarray(tr_valid[tr_uncertain_mask], dtype=np.int64),
+        tr_reject_times=np.asarray(tr_valid[tr_reject_mask], dtype=np.int64),
     )
+
+
+def compute_mean_ei(
+    raw_data: np.ndarray,
+    spike_times: np.ndarray,
+    window: tuple,
+    max_spikes: int = 300,
+    random_state: int = 42,
+    batch_size: int = 64,
+) -> Optional[np.ndarray]:
+    """Mean EI [n_channels, n_samples] over a subset of spike times.
+
+    **Memory:** never materializes a full ``[C, L, N]`` block for all spikes.
+    With a 512-ch probe, ``N=5000`` would be ~0.6–0.8 GB per channel and was
+    OOM-killing full-file runs (~100 GB raw already resident). We accumulate
+    in small batches instead (peak ~ tens of MB).
+    """
+    spike_times = np.asarray(spike_times, dtype=np.int64)
+    if spike_times.size == 0:
+        return None
+    max_spikes = max(1, int(max_spikes))
+    batch_size = max(8, int(batch_size))
+    if spike_times.size > max_spikes:
+        rng = np.random.RandomState(random_state)
+        spike_times = np.sort(rng.choice(spike_times, max_spikes, replace=False))
+
+    chans = np.arange(raw_data.shape[1], dtype=np.int32)
+    acc: Optional[np.ndarray] = None
+    n_used = 0
+    for i0 in range(0, spike_times.size, batch_size):
+        batch = spike_times[i0 : i0 + batch_size]
+        snips, _ = extract_snippets_fast_ram(
+            raw_data, batch, window=window, selected_channels=chans
+        )
+        if snips.size == 0 or snips.shape[2] == 0:
+            continue
+        batch_sum = snips.sum(axis=2)  # [C, L]
+        if acc is None:
+            acc = batch_sum.astype(np.float64, copy=False)
+        else:
+            acc += batch_sum
+        n_used += int(snips.shape[2])
+        del snips, batch_sum
+
+    if acc is None or n_used == 0:
+        return None
+    return (acc / float(n_used)).astype(np.float32)
+
+
+def slim_qc_result(result: "QCResult", *, max_pca_points: int = 1500) -> "QCResult":
+    """Drop heavy diagnostic arrays so batch QC does not accumulate OOM.
+
+    Keeps everything needed for UI (hist, PCA scatter subsample, counts,
+    final_times, final_ei) and Phy export. Called at end of every channel.
+    """
+    v = result.valley
+    # Amp hist plot uses counts/edges; all local-minima arrays are huge on long recs.
+    v.all_times = np.array([], dtype=np.int64)
+    v.all_vals = np.array([], dtype=np.float32)
+    v.valley_times = np.array([], dtype=np.int64)
+    v.valley_vals = np.array([], dtype=np.float32)
+    # rightk only needed during BL/TR (already done)
+    v.rightk_times = np.array([], dtype=np.int64)
+
+    # left_times/vals still used for export amplitudes + FR fallback — keep, but
+    # cap extremely large left sets (rare) to protect RAM.
+    if v.left_times is not None and v.left_times.size > 50_000:
+        rng = np.random.RandomState(0)
+        keep = np.sort(rng.choice(v.left_times.size, 50_000, replace=False))
+        v.left_times = np.asarray(v.left_times, dtype=np.int64)[keep]
+        if v.left_vals is not None and v.left_vals.size >= keep.size:
+            v.left_vals = np.asarray(v.left_vals, dtype=np.float32)[keep]
+        v.left_count = int(v.left_times.size)
+
+    # PCA scatter: keep a display subsample
+    pca = result.pca_km
+    n_pts = int(pca.pca_coords.shape[0]) if pca.pca_coords is not None else 0
+    if n_pts > max_pca_points:
+        rng = np.random.RandomState(1)
+        idx = np.sort(rng.choice(n_pts, max_pca_points, replace=False))
+        pca.pca_coords = np.asarray(pca.pca_coords, dtype=np.float32)[idx]
+        if pca.km_labels is not None and pca.km_labels.size == n_pts:
+            pca.km_labels = np.asarray(pca.km_labels)[idx]
+
+    # km_info often embeds large EIs / nested dicts from precheck
+    if result.km_info:
+        keep_keys = {
+            "proceed", "verdict", "reason", "detail", "n0", "n1",
+            "n_spikes", "cluster_sizes", "cos_sim",
+        }
+        slim_info = {k: result.km_info[k] for k in keep_keys if k in result.km_info}
+        # store scalar explained-variance summary only
+        vr = result.km_info.get("vr")
+        if vr is not None:
+            try:
+                slim_info["vr"] = np.asarray(vr, dtype=np.float32).ravel()[:3]
+            except Exception:
+                pass
+        result.km_info = slim_info
+
+    # BL/TR probe arrays — counts + keep times already applied to final_times
+    bl = result.bltr
+    bl.labels = np.array([], dtype=object)
+    bl.bl_bulk = np.array([], dtype=np.float32)
+    bl.tr_bulk = np.array([], dtype=np.float32)
+    bl.times = np.array([], dtype=np.int64)
+    bl.bl_uncertain_times = np.array([], dtype=np.int64)
+    bl.bl_reject_times = np.array([], dtype=np.int64)
+    bl.tr_uncertain_times = np.array([], dtype=np.int64)
+    bl.tr_reject_times = np.array([], dtype=np.int64)
+    # keep bl_keep_times / tr_keep_times only if small; final_times is source of truth
+    if bl.bl_keep_times is not None and bl.bl_keep_times.size > 5000:
+        bl.bl_keep_times = bl.bl_keep_times[:5000]
+    if bl.tr_keep_times is not None and bl.tr_keep_times.size > 5000:
+        bl.tr_keep_times = bl.tr_keep_times[:5000]
+
+    # Empty multi-channel snippet placeholder was [C, L, 0] — shrink metadata
+    sn = result.snippets
+    if sn is not None and getattr(sn, "snippets", None) is not None:
+        L = int(sn.snippet_len) if sn.snippet_len else 61
+        result.snippets = SnippetResult(
+            snippets=np.empty((1, L, 0), dtype=np.float32),
+            times=np.array([], dtype=np.int64),
+            n_channels=1,
+            snippet_len=L,
+        )
+
+    return result
 
 
 def compute_biophysics(
@@ -1360,15 +1678,25 @@ def run_qc_pipeline(
 
     # Step 1: Valley detection (all spikes)
     valley = run_valley_detection(raw_data, ch, params)
+    # Free full local-minima arrays ASAP (hist is enough for plots). On long
+    # recordings these alone are tens–hundreds of MB per channel if retained.
+    valley.all_times = np.array([], dtype=np.int64)
+    valley.all_vals = np.array([], dtype=np.float32)
 
     # Early reject: valley not accepted
     if not valley.accepted:
-        return _empty_qc_result(ch, n_sorter_spikes, valley, params, reason="valley_not_accepted")
+        return slim_qc_result(
+            _empty_qc_result(ch, n_sorter_spikes, valley, params, reason="valley_not_accepted")
+        )
 
     # Early reject: valley count > max
     max_valley = int(params.get("max_valley_count", 500))
     if valley.valley_count > max_valley:
-        return _empty_qc_result(ch, n_sorter_spikes, valley, params, reason=f"valley_count>{max_valley}")
+        return slim_qc_result(
+            _empty_qc_result(
+                ch, n_sorter_spikes, valley, params, reason=f"valley_count>{max_valley}"
+            )
+        )
 
     # Early reject: ISI 10-30 pairs
     isi_max = int(params.get("isi_10_30_max", 10))
@@ -1377,35 +1705,73 @@ def run_qc_pipeline(
         diffs = np.diff(np.sort(left_times))
         isi_pairs = int(np.sum((diffs >= 10) & (diffs <= 30)))
         if isi_pairs > isi_max:
-            return _empty_qc_result(ch, n_sorter_spikes, valley, params, reason=f"isi_10_30>{isi_max}")
+            return slim_qc_result(
+                _empty_qc_result(
+                    ch, n_sorter_spikes, valley, params, reason=f"isi_10_30>{isi_max}"
+                )
+            )
 
     # Step 2: PCA + KMeans on left spikes
     pca_km, km_info = run_pca_kmeans_on_left_spikes(raw_data, left_times, ch, params)
 
     if not km_info["proceed"]:
-        return _empty_qc_result(ch, n_sorter_spikes, valley, params, reason=f"kmeans_reject: {km_info['verdict']}")
+        return slim_qc_result(
+            _empty_qc_result(
+                ch,
+                n_sorter_spikes,
+                valley,
+                params,
+                reason=f"kmeans_reject: {km_info['verdict']}",
+                km_info=km_info,
+                pca_km=pca_km,
+            )
+        )
 
-    # Step 3: BL/TR support (probe-based)
+    # Step 3: BL/TR support (amplitude-ranked probes + keep/drop times)
     bltr = run_bltr_support(raw_data, valley, ch, params)
 
-    # Build final spike list: left_times + rightk_times (simplified; notebook does BL/TR filtering)
-    # For QC, we just need counts; we'll accept all left and rightk times.
-    final_times = np.sort(np.unique(np.concatenate([valley.left_times, valley.rightk_times])))
+    # Step 3b: notebook final-spike filtering
+    final_times = build_final_times_from_bltr(
+        valley.left_times,
+        getattr(valley, "rightk_times", np.array([], dtype=np.int64)),
+        bltr,
+    )
     min_spikes = int(params.get("min_final_spikes", 200))
     if final_times.size < min_spikes:
-        return _empty_qc_result(ch, n_sorter_spikes, valley, params, reason=f"too_few_final_spikes ({final_times.size}<{min_spikes})")
+        return slim_qc_result(
+            _empty_qc_result(
+                ch,
+                n_sorter_spikes,
+                valley,
+                params,
+                reason=f"too_few_final_spikes ({final_times.size}<{min_spikes})",
+                bltr=bltr,
+                km_info=km_info,
+                pca_km=pca_km,
+            )
+        )
 
-    # Create dummy snippets (not stored)
-    snippet_len = params.get("window", (-20,40))[1] - params.get("window", (-20,40))[0] + 1
+    win = params.get("window", (-20, 40))
+    snippet_len = int(win[1] - win[0] + 1)
+    # Tiny placeholder — never allocate [C, L, 0] with C=512 retained × N channels
     dummy_snippets = SnippetResult(
-        snippets=np.empty((raw_data.shape[1], snippet_len, 0), dtype=np.float32),
+        snippets=np.empty((1, snippet_len, 0), dtype=np.float32),
         times=np.array([], dtype=np.int64),
-        n_channels=raw_data.shape[1],
+        n_channels=1,
         snippet_len=snippet_len,
     )
 
+    # Mean EI for Phy templates — small N + chunked (see compute_mean_ei)
+    final_ei = compute_mean_ei(
+        raw_data,
+        final_times,
+        window=win,
+        max_spikes=int(params.get("n_spikes_for_mean_ei", 300)),
+        random_state=int(params.get("random_state", 42)),
+        batch_size=int(params.get("mean_ei_batch_size", 64)),
+    )
+
     # ── Step 4: Biophysics Extraction ─────────────────────────────────────
-    # Calculate physiological metrics on the final spikes
     duration_s = raw_data.shape[0] / fs
     biophysics = compute_biophysics(
         raw_data=raw_data,
@@ -1413,10 +1779,10 @@ def run_qc_pipeline(
         spike_times=final_times,
         fs=fs,
         duration_s=duration_s,
-        window=params.get("window", (-20, 40))
+        window=win,
     )
 
-    return QCResult(
+    result = QCResult(
         channel=ch,
         n_sorter_spikes=n_sorter_spikes,
         valley=valley,
@@ -1425,40 +1791,51 @@ def run_qc_pipeline(
         bltr=bltr,
         biophysics=biophysics,
         km_info=km_info,
-        fs=fs
+        fs=fs,
+        final_times=final_times,
+        final_ei=final_ei,
     )
+    return slim_qc_result(result)
 
 
-def _empty_qc_result(ch, n_sorter_spikes, valley, params, reason):
+def _empty_qc_result(
+    ch,
+    n_sorter_spikes,
+    valley,
+    params,
+    reason,
+    bltr=None,
+    km_info=None,
+    pca_km=None,
+):
     """Return a QCResult indicating rejection with empty data."""
-    snippet_len = params.get("window", (-20,40))[1] - params.get("window", (-20,40))[0] + 1
+    snippet_len = params.get("window", (-20, 40))[1] - params.get("window", (-20, 40))[0] + 1
     dummy_snippets = SnippetResult(
         snippets=np.empty((1, snippet_len, 0), dtype=np.float32),
         times=np.array([], dtype=np.int64),
         n_channels=1,
         snippet_len=snippet_len,
     )
-    dummy_pca = PCAKMeansResult(
-        pca_coords=np.empty((0, 3), dtype=np.float32),
-        km_labels=np.array([], dtype=np.int64),
-        cluster_mean_waveforms=[np.zeros(snippet_len), np.zeros(snippet_len)],
-        explained_variance_ratio=np.array([0.33,0.33,0.33], dtype=np.float32),
-        n_pcs_used=3,
-    )
-    dummy_bltr = BLTRResult(
-        labels=np.array([], dtype=object),
-        bl_bulk=np.array([], dtype=np.float32),
-        tr_bulk=np.array([], dtype=np.float32),
-        counts={"LH":0,"soup":0,"uncertain_boundary":0,"uncertain_lowBL":0},
-        times=np.array([], dtype=np.int64),
-    )
-    
+    if pca_km is None:
+        pca_km = PCAKMeansResult(
+            pca_coords=np.empty((0, 3), dtype=np.float32),
+            km_labels=np.array([], dtype=np.int64),
+            cluster_mean_waveforms=[np.zeros(snippet_len), np.zeros(snippet_len)],
+            explained_variance_ratio=np.array([0.33, 0.33, 0.33], dtype=np.float32),
+            n_pcs_used=3,
+        )
+    if bltr is None:
+        bltr = _empty_bltr_result()
+
     return QCResult(
         channel=ch,
         n_sorter_spikes=n_sorter_spikes,
         valley=valley,
         snippets=dummy_snippets,
-        pca_km=dummy_pca,
-        bltr=dummy_bltr,
-        reject_reason=reason,  # <-- Pass it here!
+        pca_km=pca_km,
+        bltr=bltr,
+        reject_reason=reason,
+        km_info=km_info or {},
+        final_times=np.array([], dtype=np.int64),
+        final_ei=None,
     )

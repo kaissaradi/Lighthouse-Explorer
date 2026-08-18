@@ -2,18 +2,17 @@
 qc_worker.py — Unified worker module for all background tasks.
 
 Contains:
-  • Native threading helpers (configure_native_thread_environment, native_thread_limits)
-  • QCChannelTaskSignals / QCChannelTask — the atomic QRunnable unit
-  • TaskManager — single-channel + batch dispatch via shared QThreadPool
+  • QCChannelTask — single-channel QC as QRunnable
+  • TaskManager — single-channel + batch dispatch (ALWAYS max 1 pool thread;
+    multi-worker Numba QC is unsafe and historically crashed)
   • LoaderWorker — file I/O + baseline subtraction on a background QThread
+  • SorterLoaderWorker — Kilosort folder parse on a background QThread
 
-Both single-channel QC and batch QC now route through the same QCChannelTask
-(QRunnable) dispatched onto a shared QThreadPool.  This eliminates the old
-QObject/QThread boilerplate while retaining the memory-safety guardrails:
-
-  • self._tasks list keeps Python references alive until completion/abort.
-  • .deleteLater() is called on signal objects via _cleanup_task().
-  • native_thread_limits(1) is enforced inside each QCChannelTask.run().
+Memory / concurrency guardrails:
+  • self._tasks keeps Python references alive until completion/abort
+  • .deleteLater() on signal emitters after task completion
+  • native_thread_limits(1) inside each QCChannelTask.run()
+  • QThreadPool maxThreadCount is hard-capped at 1
 """
 from __future__ import annotations
 
@@ -38,6 +37,9 @@ from core.lh_qc_pipeline import QCResult
 # ── Constants ────────────────────────────────────────────────────────────────
 
 DEFAULT_NATIVE_THREADS_PER_TASK = 1
+# Hard cap: Numba + multi-QThreadPool workers has repeatedly segfaulted.
+MAX_QC_POOL_THREADS = 1
+BASELINE_SEGMENT_LEN = 100_000
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -96,10 +98,26 @@ class QCChannelTask(QRunnable):
                     params=self.params,
                     fs=self.fs,
                 )
-            self.signals.result_ready.emit(result)
+            # Drop raw_data ref on this task so GC can reclaim peak scratch
+            # sooner under sequential batch (recording stays owned by MainWindow).
+            self.raw_data = None
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+            try:
+                self.signals.result_ready.emit(result)
+            except RuntimeError:
+                # Signals already deleteLater()'d (abort / window close) — drop.
+                pass
         except Exception as e:
+            self.raw_data = None
             err_msg = f"{str(e)}\n{traceback.format_exc()}"
-            self.signals.error.emit({"ch": self.ch, "msg": err_msg})
+            try:
+                self.signals.error.emit({"ch": self.ch, "msg": err_msg})
+            except RuntimeError:
+                pass
 
 
 # ── TaskManager (unified dispatch) ──────────────────────────────────────────
@@ -152,16 +170,25 @@ class TaskManager(QObject):
         )
 
         # ── Internal state ──────────────────────────────────────────────────
+        # NEVER raise above MAX_QC_POOL_THREADS — Numba/TBB multi-worker is unsafe.
         self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(1)
+        self._pool.setMaxThreadCount(MAX_QC_POOL_THREADS)
 
         # CRITICAL: Prevents Python GC from killing in-flight QRunnable tasks.
+        # Batch mode keeps at most ONE task here (sequential dispatch).
         self._tasks: list[QCChannelTask] = []
 
         self._batch_abort = False
         self._batch_completed = 0
         self._batch_total = 0
         self._running_batch = False
+        # Sequential batch state — do NOT enqueue all channels at once
+        # (that flooded Qt with 500+ QRunnables and freezes after ~N channels).
+        self._batch_raw = None
+        self._batch_params: dict | None = None
+        self._batch_fs: float = 20_000.0
+        self._batch_sorter: dict | None = None
+        self._batch_next_ch: int = 0
 
     # ── Single-channel QC ───────────────────────────────────────────────────
 
@@ -180,7 +207,8 @@ class TaskManager(QObject):
         """
         params = params if params else dict(DEFAULT_PARAMS)
         fs = _resolve_fs(params, fs)
-        self.single_progress.emit(f"Running QC on CH {channel}...")
+        # UI labels are 1-based; internal channel index is 0-based.
+        self.single_progress.emit(f"Running QC on CH {channel + 1}...")
 
         task = QCChannelTask(
             raw_data=raw_data,
@@ -205,14 +233,14 @@ class TaskManager(QObject):
         pass  # No separate abort flag needed; single tasks are fire-and-forget.
 
     def _on_single_result(self, result: QCResult) -> None:
-        self.single_progress.emit(f"QC done for CH {result.channel}.")
+        self.single_progress.emit(f"QC done for CH {result.channel + 1}.")
         self.single_result.emit(result)
         self._cleanup_task_by_channel(result.channel)
 
     def _on_single_error(self, err_info: dict) -> None:
         ch = err_info["ch"]
         msg = err_info["msg"]
-        self.single_error.emit(f"QC failed on CH {ch}: {msg}")
+        self.single_error.emit(f"QC failed on CH {ch + 1}: {msg}")
         self._cleanup_task_by_channel(ch)
 
     # ── Batch QC ────────────────────────────────────────────────────────────
@@ -229,10 +257,11 @@ class TaskManager(QObject):
         fs: float | None = None,
     ) -> None:
         """
-        Submit QC tasks for every channel in ``raw_data`` to the thread pool.
+        Run QC on every channel **sequentially** (one in-flight task).
 
-        Progress is reported via ``batch_progress`` and ``batch_channel_done``.
-        On completion, ``batch_finished`` is emitted with ``{"total": N}``.
+        Multi-worker pool is forbidden (Numba). We also avoid enqueueing all
+        channels up front — that used to freeze the GUI after ~tens of channels
+        under load (hundreds of live QRunnables + signal objects).
         """
         try:
             self.abort_batch()  # clean up any previous batch
@@ -242,42 +271,60 @@ class TaskManager(QObject):
             sorter_spike_times = sorter_spike_times or {}
             params = params if params else dict(DEFAULT_PARAMS)
             fs = _resolve_fs(params, fs)
-            self._pool.setMaxThreadCount(1)
+            # Force single worker regardless of any UI/spinbox (Numba-safe).
+            self._pool.setMaxThreadCount(MAX_QC_POOL_THREADS)
 
             _, n_channels = raw_data.shape
-            self._batch_total = n_channels
+            self._batch_total = int(n_channels)
             self._batch_completed = 0
+            self._batch_next_ch = 0
+            self._batch_raw = raw_data
+            self._batch_params = params
+            self._batch_fs = fs
+            self._batch_sorter = sorter_spike_times
             self._tasks.clear()
 
-            for ch in range(n_channels):
-                if self._batch_abort:
-                    return
-
-                n_sorter = (
-                    len(sorter_spike_times.get(ch, []))
-                    if sorter_spike_times
-                    else -1
-                )
-
-                task = QCChannelTask(
-                    raw_data=raw_data,
-                    ch=ch,
-                    n_sorter=n_sorter,
-                    params=params,
-                    fs=fs,
-                    native_threads=self.native_threads_per_task,
-                )
-
-                task.signals.result_ready.connect(self._on_batch_task_result)
-                task.signals.error.connect(self._on_batch_task_error)
-
-                # CRITICAL: prevent GC from killing active tasks.
-                self._tasks.append(task)
-                self._pool.start(task)
+            self.batch_progress.emit(
+                f"Running QC… (0/{self._batch_total}) [1 worker, sequential]",
+                0,
+                self._batch_total,
+            )
+            self._submit_next_batch_channel()
 
         except Exception as e:
             self._running_batch = False
+            self._clear_batch_state()
             self.batch_error.emit(f"Batch QC initialization failed: {e}")
+
+    def _submit_next_batch_channel(self) -> None:
+        """Start the next channel task, or finish if the queue is empty."""
+        if self._batch_abort or not self._running_batch:
+            return
+
+        if self._batch_next_ch >= self._batch_total:
+            # All submitted; finish only when the last completion lands.
+            if self._batch_completed >= self._batch_total:
+                self._finish_batch()
+            return
+
+        ch = self._batch_next_ch
+        self._batch_next_ch += 1
+        sorter = self._batch_sorter or {}
+        n_sorter = len(sorter.get(ch, [])) if sorter else -1
+
+        task = QCChannelTask(
+            raw_data=self._batch_raw,
+            ch=ch,
+            n_sorter=n_sorter,
+            params=self._batch_params or dict(DEFAULT_PARAMS),
+            fs=self._batch_fs,
+            native_threads=self.native_threads_per_task,
+        )
+        task.signals.result_ready.connect(self._on_batch_task_result)
+        task.signals.error.connect(self._on_batch_task_error)
+
+        self._tasks = [task]  # only the in-flight task
+        self._pool.start(task)
 
     def abort_batch(self) -> None:
         """Cancel the current batch run and clean up references."""
@@ -285,43 +332,64 @@ class TaskManager(QObject):
             return
         self._batch_abort = True
         self._pool.clear()
+        for task in self._tasks:
+            try:
+                task.signals.deleteLater()
+            except Exception:
+                pass
         self._tasks.clear()
         self._running_batch = False
+        self._clear_batch_state()
         self.batch_aborted.emit()
+
+    def _clear_batch_state(self) -> None:
+        self._batch_raw = None
+        self._batch_params = None
+        self._batch_sorter = None
+        self._batch_next_ch = 0
+
+    def _finish_batch(self) -> None:
+        self._tasks.clear()
+        self._running_batch = False
+        total = self._batch_total
+        self._clear_batch_state()
+        self.batch_finished.emit({"total": total})
 
     def _on_batch_task_result(self, result: QCResult) -> None:
         if self._batch_abort:
             return
         self._batch_completed += 1
+        # Drop finished task so its signals can be deleted
+        self._cleanup_task_by_channel(result.channel)
         self.batch_channel_done.emit(result)
         self.batch_progress.emit(
             f"Running QC... ({self._batch_completed}/{self._batch_total})",
             self._batch_completed,
             self._batch_total,
         )
-        self._check_batch_finished()
+        if self._batch_completed >= self._batch_total:
+            self._finish_batch()
+        else:
+            self._submit_next_batch_channel()
 
     def _on_batch_task_error(self, err_info: dict) -> None:
         if self._batch_abort:
             return
         ch = err_info["ch"]
         msg = err_info["msg"]
-        print(f"Skipping CH {ch} due to error:\n{msg}")
+        print(f"Skipping CH {ch + 1} (0-based {ch}) due to error:\n{msg}")
         self._batch_completed += 1
+        self._cleanup_task_by_channel(ch)
         self.batch_progress.emit(
-            f"Running QC... ({self._batch_completed}/{self._batch_total}) [CH {ch} failed]",
+            f"Running QC... ({self._batch_completed}/{self._batch_total}) "
+            f"[CH {ch + 1} failed]",
             self._batch_completed,
             self._batch_total,
         )
-        self._check_batch_finished()
-
-    def _check_batch_finished(self) -> None:
-        if self._batch_completed == self._batch_total:
-            self._tasks.clear()
-            self._running_batch = False
-            self.batch_finished.emit({"total": self._batch_total})
-
-# ── Memory cleanup ──────────────────────────────────────────────────────
+        if self._batch_completed >= self._batch_total:
+            self._finish_batch()
+        else:
+            self._submit_next_batch_channel()
 
     def _cleanup_task_by_channel(self, ch: int) -> None:
         """
@@ -331,7 +399,10 @@ class TaskManager(QObject):
         remaining = []
         for task in self._tasks:
             if task.ch == ch:
-                task.signals.deleteLater()
+                try:
+                    task.signals.deleteLater()
+                except Exception:
+                    pass
             else:
                 remaining.append(task)
         self._tasks = remaining
@@ -398,7 +469,65 @@ class LoaderWorker(QObject):
             fs=self.fs,
             writable=True,  # copy-on-write — safe for in-place baseline sub
         )
+        T, C = raw_data.shape
+        mins = T / max(1.0, float(self.fs)) / 60.0
+        self.progress.emit(
+            f"Mapped {T:,} samples × {C} ch ({mins:.1f} min). Preparing baselines…"
+        )
         return raw_data
+
+    @staticmethod
+    def _choose_baseline_stride(n_samples: int, fs: float) -> int:
+        """Larger stride for long recordings — QC only needs approximate baselines."""
+        minutes = n_samples / max(1.0, float(fs)) / 60.0
+        if minutes > 30:
+            return 100
+        if minutes > 10:
+            return 50
+        if minutes > 2:
+            return 20
+        return 10
+
+    def _compute_baselines_chunked(self, raw_data):
+        """
+        Run baseline estimation in time-chunk batches so we can emit progress
+        and honor abort between batches (Numba itself is not interruptible).
+        """
+        import numpy as np
+
+        T, C = raw_data.shape
+        segment_len = BASELINE_SEGMENT_LEN
+        n_seg = (T + segment_len - 1) // segment_len
+        stride = self._choose_baseline_stride(T, self.fs)
+        out = np.empty((C, n_seg), dtype=np.float32)
+
+        # Process a few segments per Numba call so the UI gets heartbeats.
+        # Too small → overhead; too large → long uninterruptible stretches.
+        segs_per_batch = 8 if T > 20_000 * 60 * 5 else 20
+
+        done_segs = 0
+        while done_segs < n_seg:
+            if self._abort:
+                raise InterruptedError("aborted")
+            batch_n = min(segs_per_batch, n_seg - done_segs)
+            t0 = done_segs * segment_len
+            t1 = min((done_segs + batch_n) * segment_len, T)
+            chunk = raw_data[t0:t1]
+            bas = compute_baselines_int16_deriv_robust(
+                chunk, segment_len=segment_len, stride=stride
+            )
+            # bas shape [C, n_batch_segs] (last batch may be short)
+            out[:, done_segs : done_segs + bas.shape[1]] = bas
+            done_segs += bas.shape[1]
+            pct = int(100 * done_segs / max(n_seg, 1))
+            # stride = subsample step ONLY for mean-baseline estimation (speed).
+            # Full T samples remain in raw_data; QC uses the entire recording.
+            self.progress.emit(
+                f"Computing baselines… {pct}%  "
+                f"({done_segs}/{n_seg} segments; baseline subsample every "
+                f"{stride} samples — full recording kept)"
+            )
+        return out
 
     def _load_litke(self):
         """
@@ -469,9 +598,13 @@ class LoaderWorker(QObject):
                 self.aborted.emit()
                 return
 
-            # ── Step 2: Compute baselines ──────────────────────────────
-            self.progress.emit("Computing baselines…")
-            baselines = compute_baselines_int16_deriv_robust(raw_data, stride=10)
+            # ── Step 2: Compute baselines (chunked, abortible between batches)
+            self.progress.emit("Computing baselines… 0%")
+            try:
+                baselines = self._compute_baselines_chunked(raw_data)
+            except InterruptedError:
+                self.aborted.emit()
+                return
 
             if self._abort:
                 self.aborted.emit()
@@ -490,4 +623,39 @@ class LoaderWorker(QObject):
             self.finished.emit(raw_data)
 
         except Exception as e:
-            self.error.emit(f"Load failed: {e}")
+            self.error.emit(f"Load failed: {e}\n{traceback.format_exc()}")
+
+
+# ── SorterLoaderWorker (KS parse off the UI thread) ─────────────────────────
+
+class SorterLoaderWorker(QObject):
+    """Parse a Kilosort output folder without blocking the GUI."""
+
+    progress = Signal(str)
+    finished = Signal(dict)  # parse_kilosort_folder result
+    error = Signal(str)
+    aborted = Signal()
+
+    def __init__(self, ks_path: str):
+        super().__init__()
+        self.ks_path = ks_path
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
+
+    def run(self):
+        try:
+            result = loader.parse_kilosort_folder(
+                self.ks_path,
+                progress_cb=lambda msg: self.progress.emit(msg),
+                abort_cb=lambda: self._abort,
+            )
+            if self._abort:
+                self.aborted.emit()
+                return
+            self.finished.emit(result)
+        except InterruptedError:
+            self.aborted.emit()
+        except Exception as e:
+            self.error.emit(f"KS load failed: {e}\n{traceback.format_exc()}")

@@ -172,11 +172,14 @@ main_window.py — Top-level QMainWindow. Orchestrates panels and QC workflow.
 from typing import Optional
 import numpy as np
 import os
-from qtpy.QtWidgets import QMainWindow, QSplitter, QProgressBar, QPushButton
+from qtpy.QtWidgets import (
+    QMainWindow, QSplitter, QProgressBar, QPushButton, QFileDialog, QMessageBox,
+)
 from qtpy.QtCore import Qt, QThread
-from .qc_worker import TaskManager, LoaderWorker
+from .qc_worker import TaskManager, LoaderWorker, SorterLoaderWorker
 from core.lh_qc_pipeline import DEFAULT_PARAMS
 from core.lh_qc_pipeline import QCResult
+from core.ks_export import export_phy_folder
 
 
 class MainWindow(QMainWindow):
@@ -208,13 +211,26 @@ class MainWindow(QMainWindow):
         # sorter_dom_channel: {unit_id: int}
         #   — dominant electrode channel for each KS cluster, derived from
         #     templates.npy via argmax of peak-to-peak amplitude across channels.
+        #   — indices are 0-based electrode indices (same as raw_data columns
+        #     after Litke TTL strip). Must match channel_map.npy from KS.
         self.sorter_dom_channel: dict = {}
+
+        # sorter_units_by_channel: {ch: [unit_id, ...]} reverse index for fast attach
+        self.sorter_units_by_channel: dict = {}
+
+        # sorter_unit_labels: {unit_id: 'good'|'mua'|'unsorted'|...} from cluster_group.tsv
+        self.sorter_unit_labels: dict = {}
+
+        # Channel-map diagnostics from last KS parse
+        self.sorter_channel_meta: dict = {}
 
         # ── Workers / threads ────────────────────────────────────────────────
         self._loader_thread: Optional[QThread] = None
         self._loader_worker: Optional[LoaderWorker] = None
+        self._sorter_thread: Optional[QThread] = None
+        self._sorter_worker: Optional[SorterLoaderWorker] = None
 
-        # Unified task manager for single-channel AND batch QC.
+        # Unified task manager for single-channel AND batch QC (always 1 worker).
         self._task_manager = TaskManager(parent=self)
         self._connect_task_manager()
 
@@ -278,12 +294,30 @@ class MainWindow(QMainWindow):
         self._status_bar.addPermanentWidget(self._progress_bar)
         self._status_bar.showMessage("Ready. Load a recording to begin.")
 
-        # Summary button (enabled after batch QC)
+        # Summary / export buttons (enabled once we have QC results)
         self._summary_btn = QPushButton("Recording Summary")
         self._summary_btn.setEnabled(False)
         self._summary_btn.setToolTip("Show recording-level QC summary across all channels")
         self._summary_btn.clicked.connect(self._show_summary)
         self._status_bar.addPermanentWidget(self._summary_btn)
+
+        self._export_btn = QPushButton("Export Phy/KS")
+        self._export_btn.setEnabled(False)
+        self._export_btn.setToolTip(
+            "Write spike_times / spike_clusters / templates (Phy-compatible) "
+            "from LH final_times"
+        )
+        self._export_btn.clicked.connect(self._export_phy)
+        self._status_bar.addPermanentWidget(self._export_btn)
+
+        self._batch_btn = QPushButton("Run Batch QC")
+        self._batch_btn.setEnabled(False)
+        self._batch_btn.setToolTip(
+            "Run LH QC on all channels (single-threaded — safe for Numba). "
+            "Does not auto-start after load unless enabled in Load panel."
+        )
+        self._batch_btn.clicked.connect(self._on_batch_btn_clicked)
+        self._status_bar.addPermanentWidget(self._batch_btn)
 
     def _connect_signals(self):
         self._load_panel.load_requested.connect(self.on_load_requested)
@@ -294,35 +328,53 @@ class MainWindow(QMainWindow):
 
     def on_load_requested(self, params: dict):
         """Start background loading — supports flat .dat/.bin and Litke bin folder."""
-        # 1. Clear old state BEFORE starting new load
+        # Clear recording / QC state. KEEP sorter maps so KS can be loaded any time
+        # (before or after recording) without wiping comparison data.
         self.raw_data = None
         self.qc_results.clear()
-        self.sorter_spike_times.clear()
-        self.sorter_unit_map.clear()
-        self.sorter_dom_channel.clear()
         self.current_channel = None
-        
+
         self._qc_view.clear()
         self._channel_list.clear()
         self._summary_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+        self._batch_btn.setEnabled(False)
 
         self.lh_params.update(params)
+        # Absolute sample offset of memmap window (for KS time alignment)
+        fs = float(params.get("fs", 20_000) or 20_000)
+        start_min = float(params.get("start_min", 0.0) or 0.0)
+        self.lh_params["start_sample"] = int(start_min * 60.0 * fs)
 
         dat_path = params.get("dat_path")
         if not dat_path:
             self._status_bar.showMessage("No .dat file or folder specified.")
             return
 
-        self._abort_loader()
+        # Warn on full-file huge loads (these can leave <20 GB free → OOM on QC)
+        dur = params.get("duration_min")
+        n_ch = int(params.get("n_channels", 0) or 0)
+        fs = float(params.get("fs", 20_000) or 20_000)
+        if dur is None:
+            self._status_bar.showMessage(
+                "Loading FULL file into RAM (baseline-sub needs writable data). "
+                "If the process is Killed mid-batch, that is the Linux OOM killer — "
+                "use a shorter duration (min) or free RAM. Prefer short duration for testing."
+            )
+        elif dur and n_ch:
+            # Rough int16 size estimate for the window
+            est_gb = (float(dur) * 60.0 * fs * n_ch * 2.0) / (1024.0 ** 3)
+            if est_gb > 40:
+                self._status_bar.showMessage(
+                    f"Loading ~{est_gb:.0f} GB window — leave headroom; OOM = process Killed."
+                )
+
+        self._stop_loader(wait_ms=15_000)
         self._load_panel.set_loading_state(True)
 
         # Both flat .dat/.bin files AND Litke folders go through LoaderWorker.
-        # LoaderWorker.run() detects the format via os.path.isdir() and handles both:
-        #   - flat file    -> np.memmap (copy-on-write) + in-place baseline subtraction
-        #   - Litke folder -> materialised (T, C) ndarray + in-place baseline subtraction
-        # Never short-circuit to the lazy LitkeMultiFileArray here — doing so skips
-        # baseline subtraction entirely and blocks the main thread on slow per-chunk
-        # reads, which freezes the UI and stalls batch QC on channel 0.
+        # Never short-circuit to lazy LitkeMultiFileArray — that skips baseline
+        # subtraction and freezes the UI on slow per-chunk reads.
         self._loader_thread = QThread()
         self._loader_worker = LoaderWorker(
             dat_path=dat_path,
@@ -340,23 +392,54 @@ class MainWindow(QMainWindow):
         self._loader_worker.aborted.connect(self._on_loader_aborted)
 
         self._loader_worker.finished.connect(self._loader_thread.quit)
-        self._loader_worker.finished.connect(self._loader_worker.deleteLater)
         self._loader_worker.error.connect(self._loader_thread.quit)
         self._loader_worker.aborted.connect(self._loader_thread.quit)
-        self._loader_thread.finished.connect(self._loader_thread.deleteLater)
+        self._loader_thread.finished.connect(self._on_loader_thread_finished)
 
         self._loader_thread.start()
 
+    def _on_loader_thread_finished(self):
+        """Clear thread/worker refs after QThread exits cleanly."""
+        thr = self._loader_thread
+        worker = self._loader_worker
+        self._loader_thread = None
+        self._loader_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if thr is not None:
+            thr.deleteLater()
+
     def _on_loader_finished(self, raw_data):
-        """Loader completed — store data and auto-start batch QC."""
+        """Loader completed — store data; batch QC only if user opted in."""
         n_ch = raw_data.shape[1]
         self.raw_data = raw_data
         self._channel_list.set_array(np.arange(n_ch).reshape(-1, 1))
-        self._status_bar.showMessage(
-            f"Loaded {self.raw_data.shape[0]} samples × {n_ch} channels. Starting batch QC…"
-        )
         self._load_panel.set_loading_state(False)
-        self._start_batch_qc()
+        self._batch_btn.setEnabled(True)
+
+        n_samp = int(raw_data.shape[0])
+        mins = n_samp / max(1.0, float(self.lh_params.get("fs", 20_000))) / 60.0
+        auto_batch = bool(self.lh_params.get("auto_batch_qc", True))
+
+        # If KS was already loaded, re-check channel alignment vs this recording
+        ks_note = ""
+        if self.sorter_unit_map or self.sorter_spike_times:
+            align = self._validate_sorter_channel_alignment()
+            ks_note = f" | KS: {len(self.sorter_unit_map)} units"
+            if align:
+                ks_note += f" ({align})"
+
+        if auto_batch:
+            self._status_bar.showMessage(
+                f"Loaded {n_samp:,} samples × {n_ch} ch ({mins:.1f} min)"
+                f"{ks_note}. Starting batch QC (1 worker, sequential)…"
+            )
+            self._start_batch_qc()
+        else:
+            self._status_bar.showMessage(
+                f"Loaded {n_samp:,} samples × {n_ch} ch ({mins:.1f} min)"
+                f"{ks_note}. Click a channel for QC, or 'Run Batch QC'."
+            )
 
     def _on_loader_error(self, msg: str):
         self._status_bar.showMessage(msg)
@@ -367,118 +450,245 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage("Loading cancelled.")
         self._load_panel.set_loading_state(False)
 
-    def _abort_loader(self):
-        if self._loader_worker:
-            self._loader_worker.abort()
-        if self._loader_thread and self._loader_thread.isRunning():
-            self._loader_thread.quit()
+    def _stop_loader(self, wait_ms: int = 30_000) -> bool:
+        """
+        Request abort and wait for the loader thread to finish.
 
-    # ── KiloSort loading ──────────────────────────────────────────────────────
+        Returns True if the thread is no longer running.
+        Never calls terminate() (unsafe with Numba).
+        """
+        worker = self._loader_worker
+        thr = self._loader_thread
+        if worker is not None:
+            worker.abort()
+        if thr is None:
+            return True
+        if thr.isRunning():
+            thr.quit()
+            finished = thr.wait(wait_ms)
+            if not finished:
+                # Still blocked inside Numba — wait a bit longer once more.
+                finished = thr.wait(5_000)
+            if not finished:
+                self._status_bar.showMessage(
+                    "Loader still running in background — wait before closing again."
+                )
+                return False
+        return True
+
+    # ── KiloSort loading (background thread) ──────────────────────────────────
 
     def on_sorter_load_requested(self, path: str):
-        """
-        Load a KiloSort output folder and build three lookup structures:
+        """Start background KS parse — never blocks the UI thread."""
+        path = (path or "").strip()
+        if not path:
+            self._status_bar.showMessage("No KS folder specified.")
+            return
+        if not os.path.isdir(path):
+            self._status_bar.showMessage(f"KS path is not a directory: {path}")
+            return
 
-          self.sorter_unit_map     {unit_id: spike_times_array}
-          self.sorter_dom_channel  {unit_id: dominant_electrode_channel}
-          self.sorter_spike_times  {electrode_ch: pooled_spike_times_array}
+        self._stop_sorter(wait_ms=10_000)
+        self._load_panel.set_sorter_loading_state(True)
+        self._status_bar.showMessage("Loading KiloSort output (background)…")
 
-        Required files (all standard KS2/KS4 outputs):
-          spike_times.npy    — [nSpikes] uint64, sample indices
-          spike_clusters.npy — [nSpikes] uint32, cluster ID per spike
-          templates.npy      — [nTemplates, nTimepoints, nChannels] float32
-          channel_map.npy    — [nChannels] int32, maps template ch idx → electrode ch
+        self._sorter_thread = QThread()
+        self._sorter_worker = SorterLoaderWorker(path)
+        self._sorter_worker.moveToThread(self._sorter_thread)
+        self._sorter_thread.started.connect(self._sorter_worker.run)
+        self._sorter_worker.progress.connect(self._status_bar.showMessage)
+        self._sorter_worker.finished.connect(self._on_sorter_finished)
+        self._sorter_worker.error.connect(self._on_sorter_error)
+        self._sorter_worker.aborted.connect(self._on_sorter_aborted)
 
-        Optional:
-          cluster_group.tsv  — if present, noise clusters are excluded automatically.
-        """
+        self._sorter_worker.finished.connect(self._sorter_thread.quit)
+        self._sorter_worker.error.connect(self._sorter_thread.quit)
+        self._sorter_worker.aborted.connect(self._sorter_thread.quit)
+        self._sorter_thread.finished.connect(self._on_sorter_thread_finished)
+
+        self._sorter_thread.start()
+
+    def _on_sorter_thread_finished(self):
+        thr = self._sorter_thread
+        worker = self._sorter_worker
+        self._sorter_thread = None
+        self._sorter_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if thr is not None:
+            thr.deleteLater()
+
+    def _on_sorter_finished(self, result: dict):
+        self.sorter_unit_map = result.get("unit_map", {})
+        self.sorter_dom_channel = result.get("dom_channel", {})
+        self.sorter_spike_times = result.get("spike_times_by_channel", {})
+        self.sorter_units_by_channel = result.get("units_by_channel", {})
+        self.sorter_unit_labels = result.get("unit_labels", {})
+        self.sorter_channel_meta = {
+            "channel_map_min": result.get("channel_map_min"),
+            "channel_map_max": result.get("channel_map_max"),
+            "channel_map_n": result.get("channel_map_n"),
+            "channel_map_is_identity": result.get("channel_map_is_identity"),
+            "template_n_channels": result.get("template_n_channels"),
+        }
+        self._load_panel.set_sorter_loading_state(False)
+
+        # Drop / flag channels that don't exist on the loaded recording
+        align_note = self._validate_sorter_channel_alignment()
+
+        n_units = int(result.get("n_units", len(self.sorter_unit_map)))
+        n_ch = int(result.get("n_channels_covered", len(self.sorter_spike_times)))
+        n_noise = int(result.get("n_noise_excluded", 0))
+        n_unmapped = int(result.get("n_unmapped_units", 0))
+        cmap_n = result.get("channel_map_n")
+        cmap_id = result.get("channel_map_is_identity")
+        msg = f"KS loaded: {n_units} units across {n_ch} channels"
+        if cmap_n is not None:
+            msg += f" | map 0-based ch 0…{int(result.get('channel_map_max', 0))}"
+            if cmap_id:
+                msg += " (identity)"
+        if n_noise:
+            msg += f" ({n_noise} noise excluded)"
+        if n_unmapped:
+            msg += f" [{n_unmapped} units w/o peak channel]"
+        if align_note:
+            msg += f" | {align_note}"
+        self._status_bar.showMessage(msg)
+
+        # Re-attach to EVERY finished QC result so Venn/miss update immediately
+        self._reattach_sorter_to_all_results()
+
+    def _on_sorter_error(self, msg: str):
+        self._load_panel.set_sorter_loading_state(False)
+        self._status_bar.showMessage(msg.split("\n", 1)[0])
+
+    def _on_sorter_aborted(self):
+        self._load_panel.set_sorter_loading_state(False)
+        self._status_bar.showMessage("KS load cancelled.")
+
+    def _stop_sorter(self, wait_ms: int = 10_000) -> bool:
+        worker = self._sorter_worker
+        thr = self._sorter_thread
+        if worker is not None:
+            worker.abort()
+        if thr is None:
+            return True
+        if thr.isRunning():
+            thr.quit()
+            return bool(thr.wait(wait_ms))
+        return True
+
+    def _clip_times_to_loaded_window(self, times: np.ndarray) -> np.ndarray:
+        """Map absolute KS sample indices into the loaded memmap window."""
+        times = np.asarray(times, dtype=np.int64)
+        if times.size == 0:
+            return times
+        start = int(self.lh_params.get("start_sample", 0) or 0)
+        rel = times - start
+        if self.raw_data is None:
+            return rel[rel >= 0]
+        t_max = int(self.raw_data.shape[0])
+        return rel[(rel >= 0) & (rel < t_max)]
+
+    def _recording_n_channels(self) -> int | None:
+        if self.raw_data is not None:
+            return int(self.raw_data.shape[1])
+        n = self.lh_params.get("n_channels")
         try:
-            self._status_bar.showMessage("Loading KiloSort output…")
+            return int(n) if n is not None else None
+        except (TypeError, ValueError):
+            return None
 
-            # ── 1. Load required npy files ───────────────────────────────────
-            spike_times   = np.load(os.path.join(path, "spike_times.npy")).flatten().astype(np.int64)
-            spike_clusters = np.load(os.path.join(path, "spike_clusters.npy")).flatten().astype(np.int32)
-            templates     = np.load(os.path.join(path, "templates.npy"))   # [nTemplates, T, C]
-            channel_map   = np.load(os.path.join(path, "channel_map.npy")).flatten().astype(np.int32)
+    def _validate_sorter_channel_alignment(self) -> str:
+        """
+        Confirm KS peak-channel indices line up with recording columns.
 
-            # ── 2. Optional: filter out noise clusters ───────────────────────
-            noise_ids: set = set()
-            group_path = os.path.join(path, "cluster_group.tsv")
-            if os.path.exists(group_path):
-                import csv
-                with open(group_path, newline="") as f:
-                    reader = csv.DictReader(f, delimiter="\t")
-                    for row in reader:
-                        if row.get("group", "").strip().lower() == "noise":
-                            noise_ids.add(int(row["cluster_id"]))
+        Convention (lab Litke + KS):
+          • Litke loader strips TTL ch 0 → raw_data cols are electrodes 0..C-1
+          • KS channel_map.npy is typically identity arange(C) on the same
+            pre-stripped dat (n_channels_dat = C)
+          • Both use 0-based indices; UI labels are 1-based (CH 1 = index 0)
 
-            # ── 3. Dominant channel per unit ─────────────────────────────────
-            # templates shape: [nTemplates, nTimepoints, nChannels]
-            # ptp across time axis → [nTemplates, nChannels]
-            # argmax across channel axis → [nTemplates] — index into channel_map
-            template_ptp = templates.max(axis=1) - templates.min(axis=1)        # [nTemplates, nChannels]
-            template_dom_idx = template_ptp.argmax(axis=1)  # [nTemplates] — channel_map index
-            # Map from template index → electrode channel number
-            template_dom_ch = channel_map[template_dom_idx] # [nTemplates]
+        Returns a short status note (empty if nothing notable).
+        """
+        n_rec = self._recording_n_channels()
+        if n_rec is None:
+            return "load recording to verify channel alignment"
 
-            # ── 4. Build unit_map and dom_channel ────────────────────────────
-            self.sorter_unit_map = {}
-            self.sorter_dom_channel = {}
+        meta = self.sorter_channel_meta or {}
+        cmap_max = meta.get("channel_map_max")
+        cmap_min = meta.get("channel_map_min")
+        keys = list(self.sorter_spike_times.keys())
+        if not keys and cmap_max is None:
+            return "KS has no channel-mapped spikes"
 
-            unique_units = np.unique(spike_clusters)
-            for uid in unique_units:
-                if uid in noise_ids:
-                    continue
-                mask = spike_clusters == uid
-                unit_times = spike_times[mask]
-                self.sorter_unit_map[int(uid)] = unit_times
-                # cluster id == template id in KS output (may differ after manual
-                # merges in Phy, but cluster id is still a valid template index
-                # as long as it's in range)
-                if uid < len(template_dom_ch):
-                    self.sorter_dom_channel[int(uid)] = int(template_dom_ch[uid])
-                else:
-                    # Fallback: compute dominant channel directly from spikes
-                    self.sorter_dom_channel[int(uid)] = -1
+        max_ks = int(cmap_max) if cmap_max is not None else (max(keys) if keys else -1)
+        min_ks = int(cmap_min) if cmap_min is not None else (min(keys) if keys else 0)
 
-            # ── 5. Build per-electrode sorter_spike_times ────────────────────
-            # This is the dict TaskManager uses for miss-rate counting:
-            # {electrode_ch: all spike times of all units whose dom ch == electrode_ch}
-            ch_to_times: dict[int, list] = {}
-            for uid, times in self.sorter_unit_map.items():
-                dom_ch = self.sorter_dom_channel.get(uid, -1)
-                if dom_ch < 0:
-                    continue
-                if dom_ch not in ch_to_times:
-                    ch_to_times[dom_ch] = []
-                ch_to_times[dom_ch].append(times)
-
-            self.sorter_spike_times = {
-                ch: np.sort(np.concatenate(time_lists))
-                for ch, time_lists in ch_to_times.items()
-            }
-
-            n_units = len(self.sorter_unit_map)
-            n_ch_covered = len(self.sorter_spike_times)
-            self._status_bar.showMessage(
-                f"KS loaded: {n_units} units across {n_ch_covered} channels"
-                + (f" ({len(noise_ids)} noise excluded)" if noise_ids else "")
+        # Drop OOR channels so we never attach spikes to missing electrodes
+        oor = [ch for ch in keys if ch < 0 or ch >= n_rec]
+        if oor:
+            for ch in oor:
+                self.sorter_spike_times.pop(ch, None)
+                self.sorter_units_by_channel.pop(ch, None)
+            # Also drop unit maps whose dom ch is OOR
+            bad_uids = [
+                uid for uid, dch in self.sorter_dom_channel.items()
+                if dch < 0 or dch >= n_rec
+            ]
+            for uid in bad_uids:
+                self.sorter_unit_map.pop(uid, None)
+                self.sorter_dom_channel.pop(uid, None)
+                self.sorter_unit_labels.pop(uid, None)
+            return (
+                f"⚠️ {len(oor)} KS channels outside recording 0…{n_rec - 1} "
+                f"(KS range {min_ks}…{max_ks}) — dropped"
             )
 
-        except FileNotFoundError as e:
-            self._status_bar.showMessage(f"KS load failed — missing file: {e}")
-        except Exception as e:
-            self._status_bar.showMessage(f"KS load failed: {e}")
+        if max_ks >= n_rec or min_ks < 0:
+            return (
+                f"⚠️ KS channel_map {min_ks}…{max_ks} vs recording 0…{n_rec - 1}"
+            )
+
+        if meta.get("channel_map_is_identity") and max_ks == n_rec - 1:
+            return f"aligned ✓ (0…{n_rec - 1})"
+        if max_ks < n_rec:
+            return f"aligned ✓ (KS covers 0…{max_ks} of {n_rec} ch)"
+        return "aligned ✓"
+
+    def _reattach_sorter_to_all_results(self) -> None:
+        """Push current KS maps onto every cached QCResult and refresh UI."""
+        if not self.qc_results:
+            return
+        for ch, r in self.qc_results.items():
+            self._attach_sorter_data(r)
+            r.n_sorter_spikes = self._n_sorter_spikes_for_channel(ch)
+            self._channel_list.update_channel_result(ch, r)
+        if self.current_channel is not None and self.current_channel in self.qc_results:
+            self._qc_view.show_result(self.qc_results[self.current_channel])
 
     # ── Batch QC lifecycle ────────────────────────────────────────────────────
 
+    def _on_batch_btn_clicked(self):
+        if self.raw_data is None:
+            self._status_bar.showMessage("Load a recording first.")
+            return
+        if self._task_manager.is_batch_running:
+            self._status_bar.showMessage("Batch QC already running…")
+            return
+        self._start_batch_qc()
+
     def _start_batch_qc(self):
-        """Start running QC on all channels via the unified TaskManager."""
+        """Start running QC on all channels (always 1 pool thread — Numba-safe)."""
         if self.raw_data is None:
             return
 
         self._task_manager.abort_batch()
         self._channel_list.hide_progress()
+        self._batch_btn.setEnabled(False)
+        self._status_bar.showMessage(
+            f"Batch QC starting on {self.raw_data.shape[1]} channels (1 worker)…"
+        )
 
         self._task_manager.start_batch(
             raw_data=self.raw_data,
@@ -495,26 +705,56 @@ class MainWindow(QMainWindow):
         """
         Attach KS data to a QCResult after pipeline completion.
 
+        Channel index convention (must match on both sides):
+          result.channel is 0-based raw_data column index (post Litke TTL strip).
+          KS peak channels come from channel_map[argmax_ptp(templates)] and are
+          also 0-based electrode indices into that same coordinate system.
+
         Populates:
           result.fs               — sampling rate from lh_params
           result.sorter_times     — pooled spike times for all KS units on this ch
-                                    (used for FR-over-time overlay in the view panel)
+                                    (clipped to loaded window; relative samples)
           result.sorter_unit_map  — {unit_id: times} for units whose dominant
                                     channel == result.channel
-                                    (used for Venn / raster in the view panel)
+          result.sorter_unit_labels — {unit_id: good|mua|...} for those units
         """
         ch = result.channel
         result.fs = self.lh_params.get("fs", 20_000)
 
-        # Pooled times — already keyed by electrode channel
-        result.sorter_times = self.sorter_spike_times.get(ch, None)
+        # Pooled times — keyed by 0-based electrode index (same as raw_data cols)
+        pooled = self.sorter_spike_times.get(ch, None)
+        if pooled is not None:
+            clipped = self._clip_times_to_loaded_window(pooled)
+            result.sorter_times = clipped if clipped.size else np.array([], dtype=np.int64)
+        else:
+            result.sorter_times = np.array([], dtype=np.int64)
 
-        # Per-unit map — only units whose dominant channel is this electrode
-        result.sorter_unit_map = {
-            uid: times
-            for uid, times in self.sorter_unit_map.items()
-            if self.sorter_dom_channel.get(uid, -1) == ch
-        }
+        # Per-unit map via reverse index (O(units on ch), not O(all units))
+        unit_map: dict = {}
+        unit_labels: dict = {}
+        uids = self.sorter_units_by_channel.get(ch)
+        if uids is None:
+            # Fallback if older parse without reverse index
+            uids = [
+                uid for uid, dch in self.sorter_dom_channel.items() if dch == ch
+            ]
+        for uid in uids:
+            times = self.sorter_unit_map.get(uid)
+            if times is None:
+                continue
+            clipped = self._clip_times_to_loaded_window(times)
+            if clipped.size:
+                unit_map[uid] = clipped
+                unit_labels[uid] = self.sorter_unit_labels.get(uid, "unsorted")
+        result.sorter_unit_map = unit_map
+        result.sorter_unit_labels = unit_labels
+
+        # Keep n_sorter_spikes in sync (used by miss-rate badge)
+        result.n_sorter_spikes = (
+            int(result.sorter_times.size)
+            if result.sorter_times is not None and result.sorter_times.size
+            else (0 if self.sorter_spike_times else -1)
+        )
 
     def _on_batch_channel_done(self, result: QCResult):
         ch = result.channel
@@ -526,6 +766,7 @@ class MainWindow(QMainWindow):
 
     def _on_batch_finished(self, results: dict):
         self._channel_list.hide_progress()
+        self._batch_btn.setEnabled(self.raw_data is not None)
 
         lh_count = sum(1 for r in self.qc_results.values() if r.n_lh > 0)
         total = results.get("total", len(self.qc_results))
@@ -533,6 +774,7 @@ class MainWindow(QMainWindow):
             f"Batch QC complete: {lh_count}/{total} channels with LH spikes found."
         )
         self._summary_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
         self._channel_list._view_combo.setCurrentText("LH Found")
 
         for ch, result in sorted(self.qc_results.items()):
@@ -544,11 +786,13 @@ class MainWindow(QMainWindow):
 
     def _on_batch_error(self, msg: str):
         self._channel_list.hide_progress()
+        self._batch_btn.setEnabled(self.raw_data is not None)
         self._status_bar.showMessage(f"Batch QC failed: {msg}")
         self._qc_view.show_error(msg)
 
     def _on_batch_aborted(self):
         self._channel_list.hide_progress()
+        self._batch_btn.setEnabled(self.raw_data is not None)
         self._status_bar.showMessage(
             f"Batch QC cancelled. {len(self.qc_results)} channels completed."
         )
@@ -564,14 +808,15 @@ class MainWindow(QMainWindow):
         self.current_channel = ch
         self._channel_list.set_selected_channel(ch)
 
+        dch = ch + 1  # UI is 1-based
         if ch in self.qc_results:
             self._qc_view.show_result(self.qc_results[ch])
-            self._status_bar.showMessage(f"CH {ch}: cached result displayed.")
+            self._status_bar.showMessage(f"CH {dch}: cached result displayed.")
             return
 
         if self._task_manager.is_batch_running:
             self._qc_view.show_loading(ch)
-            self._status_bar.showMessage(f"CH {ch}: queued for batch QC…")
+            self._status_bar.showMessage(f"CH {dch}: queued for batch QC…")
             return
 
         self._qc_view.show_loading(ch)
@@ -594,10 +839,18 @@ class MainWindow(QMainWindow):
         self.qc_results[ch] = result
         self._qc_view.show_result(result)
         self._channel_list.update_channel_result(ch, result)
+        self._summary_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
 
-        label = f"CH {ch}: {result.n_lh} LH, {result.n_soup} soup, {result.n_uncertain} uncertain"
+        dch = ch + 1
+        label = (
+            f"CH {dch}: {result.n_lh} LH, {result.n_soup} soup, "
+            f"{result.n_uncertain} uncertain"
+        )
         if result.miss_rate is not None:
             label += f", miss={result.miss_rate:.1%}"
+        if result.n_sorter_spikes >= 0:
+            label += f", KS={result.n_sorter_spikes}"
         self._status_bar.showMessage(label)
 
     def on_single_qc_error(self, msg: str):
@@ -607,13 +860,18 @@ class MainWindow(QMainWindow):
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _n_sorter_spikes_for_channel(self, ch: int) -> int:
-        """Return count of pooled KS spikes on electrode ch, or -1 if unknown."""
-        if not self.sorter_spike_times:
+        """Return count of pooled KS spikes on electrode ch in the loaded window.
+
+        Returns -1 if no sorter has been loaded at all; 0 if sorter loaded but
+        this channel has no spikes in-window.
+        """
+        if not self.sorter_spike_times and not self.sorter_unit_map:
             return -1
         times = self.sorter_spike_times.get(ch, None)
-        if times is None:
-            return -1
-        return int(len(times))
+        if times is None or np.asarray(times).size == 0:
+            return 0
+        clipped = self._clip_times_to_loaded_window(times)
+        return int(clipped.size)
 
     def _show_summary(self):
         """Open the recording-level QC summary dialog."""
@@ -628,9 +886,75 @@ class MainWindow(QMainWindow):
         )
         dlg.exec_()
 
+    def _export_phy(self):
+        """Write a Phy/Kilosort-compatible folder from current QC results."""
+        if not self.qc_results:
+            self._status_bar.showMessage("No QC results to export.")
+            return
+
+        out_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select (or create) folder for Phy/KS export",
+        )
+        if not out_dir:
+            return
+
+        n_channels = (
+            int(self.raw_data.shape[1])
+            if self.raw_data is not None
+            else int(self.lh_params.get("n_channels", 0) or 0)
+        )
+        if n_channels < 1:
+            QMessageBox.warning(
+                self,
+                "Export failed",
+                "Unknown channel count — load a recording first.",
+            )
+            return
+
+        dat_path = self.lh_params.get("dat_path")
+        fs = float(self.lh_params.get("fs", 20_000))
+        dtype = str(self.lh_params.get("dtype", "int16"))
+
+        try:
+            info = export_phy_folder(
+                out_dir,
+                self.qc_results,
+                n_channels=n_channels,
+                fs=fs,
+                dat_path=dat_path,
+                dtype=dtype,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            self._status_bar.showMessage(f"Export failed: {exc}")
+            return
+
+        msg = (
+            f"Exported {info['n_units']} units / {info['n_spikes']} spikes → {info['out_dir']}"
+        )
+        self._status_bar.showMessage(msg)
+        QMessageBox.information(self, "Export complete", msg)
+
     def closeEvent(self, event):
-        self._abort_loader()
+        """Graceful shutdown: abort workers and wait so QThreads don't get destroyed live."""
         self._task_manager.abort_batch()
+        loader_ok = self._stop_loader(wait_ms=20_000)
+        sorter_ok = self._stop_sorter(wait_ms=10_000)
+        if not loader_ok or not sorter_ok:
+            # Refuse to crash — ask user to wait (baselines mid-Numba can't interrupt).
+            reply = QMessageBox.question(
+                self,
+                "Background work still running",
+                "A loader/sorter thread is still finishing (Numba cannot interrupt mid-call).\n\n"
+                "Wait a few more seconds and try closing again?\n"
+                "Force quit may abort the process.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                event.ignore()
+                return
         event.accept()
 
 """

@@ -314,6 +314,229 @@ def load_channel_map(map_path: Optional[str], n_channels: int) -> np.ndarray:
     return positions
 
 
+def parse_kilosort_folder(
+    path: str,
+    *,
+    progress_cb=None,
+    abort_cb=None,
+) -> dict:
+    """
+    Parse a Kilosort/Phy output folder into lookup structures (vectorized).
+
+    This is pure CPU work intended to run off the UI thread.
+
+    Parameters
+    ----------
+    path : str
+        Kilosort output directory containing spike_times.npy, etc.
+    progress_cb : callable, optional
+        ``progress_cb(message: str)`` for status updates.
+    abort_cb : callable, optional
+        ``abort_cb() -> bool``; when True, raises InterruptedError.
+
+    Returns
+    -------
+    dict with keys:
+      unit_map : {unit_id: spike_times int64}
+      dom_channel : {unit_id: electrode_channel int}
+      spike_times_by_channel : {electrode_ch: pooled times int64}
+      units_by_channel : {electrode_ch: [unit_id, ...]}
+      unit_labels : {unit_id: 'good'|'mua'|'unsorted'|...}  (noise excluded)
+      n_noise_excluded : int
+      n_units : int
+      n_channels_covered : int
+    """
+    def _progress(msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(msg)
+
+    def _check_abort() -> None:
+        if abort_cb is not None and abort_cb():
+            raise InterruptedError("sorter load aborted")
+
+    if not path or not os.path.isdir(path):
+        raise FileNotFoundError(f"Kilosort folder not found: {path}")
+
+    times_path = os.path.join(path, "spike_times.npy")
+    clus_path = os.path.join(path, "spike_clusters.npy")
+    tmpl_path = os.path.join(path, "templates.npy")
+    cmap_path = os.path.join(path, "channel_map.npy")
+
+    for required, p in (
+        ("spike_times.npy", times_path),
+        ("spike_clusters.npy", clus_path),
+        ("templates.npy", tmpl_path),
+    ):
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"Missing required file: {required}")
+
+    _progress("Loading spike_times…")
+    _check_abort()
+    spike_times = np.asarray(np.load(times_path)).reshape(-1).astype(np.int64)
+
+    _progress("Loading spike_clusters…")
+    _check_abort()
+    spike_clusters = np.asarray(np.load(clus_path)).reshape(-1).astype(np.int32)
+
+    if spike_times.size != spike_clusters.size:
+        raise ValueError(
+            f"spike_times length ({spike_times.size}) != "
+            f"spike_clusters length ({spike_clusters.size})"
+        )
+
+    # Optional spike_templates (raw template id per spike — needed after Phy merges)
+    spike_templates = None
+    st_path = os.path.join(path, "spike_templates.npy")
+    if os.path.isfile(st_path):
+        _progress("Loading spike_templates…")
+        _check_abort()
+        spike_templates = np.asarray(np.load(st_path)).reshape(-1).astype(np.int32)
+        if spike_templates.size != spike_times.size:
+            # Degraded: ignore mismatched templates array
+            spike_templates = None
+
+    _progress("Loading channel_map / templates…")
+    _check_abort()
+    if os.path.isfile(cmap_path):
+        channel_map = np.asarray(np.load(cmap_path)).reshape(-1).astype(np.int32)
+    else:
+        channel_map = None
+
+    # mmap templates when possible to reduce peak RAM during ptp
+    templates = np.load(tmpl_path, mmap_mode="r")
+    if templates.ndim != 3 or templates.shape[0] == 0:
+        raise ValueError(f"templates.npy has unexpected shape {getattr(templates, 'shape', None)}")
+
+    _progress("Computing dominant channels…")
+    _check_abort()
+    # templates: [nTemplates, T, C] — ptp over time → argmax over channels
+    template_ptp = np.asarray(templates.max(axis=1) - templates.min(axis=1))
+    template_dom_idx = template_ptp.argmax(axis=1).astype(np.int32)
+    n_tmpl = int(template_dom_idx.size)
+    if channel_map is not None and channel_map.size > 0:
+        safe = np.clip(template_dom_idx, 0, channel_map.size - 1)
+        template_dom_ch = channel_map[safe].astype(np.int32)
+    else:
+        template_dom_ch = template_dom_idx.astype(np.int32)
+
+    # Phy/KS cluster labels: noise dropped; good/mua/unsorted kept for compare modes
+    noise_ids: set[int] = set()
+    unit_labels_all: dict[int, str] = {}  # all labels from tsv (incl. noise)
+    group_path = os.path.join(path, "cluster_group.tsv")
+    if os.path.isfile(group_path):
+        import csv
+        with open(group_path, newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                try:
+                    cid = int(row["cluster_id"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                grp = (row.get("group") or "").strip().lower() or "unsorted"
+                unit_labels_all[cid] = grp
+                if grp == "noise":
+                    noise_ids.add(cid)
+
+    _progress("Grouping spikes by unit…")
+    _check_abort()
+
+    # Vectorized group-by: sort by cluster id, then split contiguous runs
+    order = np.argsort(spike_clusters, kind="mergesort")
+    clus_sorted = spike_clusters[order]
+    times_sorted = spike_times[order]
+    tmpl_sorted = (
+        spike_templates[order] if spike_templates is not None else None
+    )
+    uniq, start_idx, counts = np.unique(clus_sorted, return_index=True, return_counts=True)
+
+    unit_map: dict[int, np.ndarray] = {}
+    dom_channel: dict[int, int] = {}
+    unit_labels: dict[int, str] = {}  # labels for kept (non-noise) units
+    n_noise = 0
+
+    for uid, st, ct in zip(uniq, start_idx, counts):
+        _check_abort()
+        uid_i = int(uid)
+        if uid_i in noise_ids:
+            n_noise += 1
+            continue
+        unit_map[uid_i] = times_sorted[st : st + ct].copy()
+        unit_labels[uid_i] = unit_labels_all.get(uid_i, "unsorted")
+
+        # Peak electrode: prefer most-common spike_templates id for this cluster
+        # (correct after Phy merges). Fallback: treat cluster id as template id.
+        tmpl_id = None
+        if tmpl_sorted is not None and ct > 0:
+            chunk = tmpl_sorted[st : st + ct]
+            chunk = chunk[(chunk >= 0) & (chunk < n_tmpl)]
+            if chunk.size > 0:
+                # bincount is O(n) and faster than Counter for int ids
+                tmpl_id = int(np.bincount(chunk).argmax())
+        if tmpl_id is None and 0 <= uid_i < n_tmpl:
+            tmpl_id = uid_i
+
+        if tmpl_id is not None and 0 <= tmpl_id < n_tmpl:
+            dom_channel[uid_i] = int(template_dom_ch[tmpl_id])
+        else:
+            dom_channel[uid_i] = -1
+
+    _progress("Pooling spikes by electrode…")
+    _check_abort()
+
+    ch_to_times: dict[int, list[np.ndarray]] = {}
+    units_by_channel: dict[int, list[int]] = {}
+    n_unmapped = 0
+    for uid, times in unit_map.items():
+        dom = dom_channel.get(uid, -1)
+        if dom < 0:
+            n_unmapped += 1
+            continue
+        d = int(dom)
+        ch_to_times.setdefault(d, []).append(times)
+        units_by_channel.setdefault(d, []).append(uid)
+
+    spike_times_by_channel = {
+        ch: np.sort(np.concatenate(parts)) if len(parts) > 1 else parts[0]
+        for ch, parts in ch_to_times.items()
+        if parts
+    }
+
+    # Channel-map diagnostics — used to confirm alignment with the recording.
+    # Lab Litke/KS folders are identity 0..n-1 (TTL already stripped before KS).
+    if channel_map is not None and channel_map.size > 0:
+        cmap_min = int(channel_map.min())
+        cmap_max = int(channel_map.max())
+        cmap_n = int(channel_map.size)
+        cmap_identity = bool(
+            cmap_min == 0 and np.array_equal(channel_map, np.arange(cmap_n, dtype=channel_map.dtype))
+        )
+    else:
+        # No map file → peak indices are raw template column indices
+        dom_vals = [d for d in dom_channel.values() if d >= 0]
+        cmap_min = int(min(dom_vals)) if dom_vals else 0
+        cmap_max = int(max(dom_vals)) if dom_vals else -1
+        cmap_n = int(n_tmpl)
+        cmap_identity = True  # treated as direct electrode indices
+
+    _progress("KS parse complete.")
+    return {
+        "unit_map": unit_map,
+        "dom_channel": dom_channel,
+        "spike_times_by_channel": spike_times_by_channel,
+        "units_by_channel": units_by_channel,
+        "unit_labels": unit_labels,
+        "n_noise_excluded": n_noise,
+        "n_units": len(unit_map),
+        "n_channels_covered": len(spike_times_by_channel),
+        "n_unmapped_units": n_unmapped,
+        "channel_map_min": cmap_min,
+        "channel_map_max": cmap_max,
+        "channel_map_n": cmap_n,
+        "channel_map_is_identity": cmap_identity,
+        "template_n_channels": int(templates.shape[2]) if templates.ndim == 3 else -1,
+    }
+
+
 def load_sorter_spike_times(
     source_path: Optional[str], n_channels: int
 ) -> dict:
